@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Memory Bandwidth Tiering"
+
+config BWTIER
+	bool "BWTIER: Memory Bandwidth Tiering"
+	help
+		Enables CXL-based Memory Bandwidth Tiering Support.
+
+endmenu

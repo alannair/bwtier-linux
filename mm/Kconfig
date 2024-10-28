@@ -1265,4 +1265,6 @@ config EXECMEM
 
 source "mm/damon/Kconfig"
 
+source "mm/bwtier/Kconfig"
+
 endmenu
