@@ -4,6 +4,7 @@ menu "Memory Bandwidth Tiering"
 
 config BWTIER
 	bool "BWTIER: Memory Bandwidth Tiering"
+	depends on NUMA && PERF_USE_VMALLOC
 	help
 		Enables CXL-based Memory Bandwidth Tiering Support.
 

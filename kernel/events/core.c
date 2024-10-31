@@ -13943,4 +13943,476 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 };
 #endif /* CONFIG_CGROUP_PERF */
 
+#ifdef CONFIG_BWTIER
+
+static int bwtier_perf_event_open(struct perf_event_attr *attrptr,
+		pid_t pid, int cpu, int group_fd, unsigned long flags)
+{
+	struct perf_event *group_leader = NULL;
+	struct perf_event *output_event = NULL;
+	struct perf_event *event, *sibling;
+	struct perf_event_pmu_context *pmu_ctx;
+	struct perf_event_context *ctx, *gctx;
+	struct task_struct *task = NULL;
+	struct file *event_file = NULL;
+	struct fd group = {NULL, 0};
+	struct pmu *pmu;
+	int err;
+	int event_fd;
+	int cgroup_fd = -1;
+	int f_flags = O_RDWR;
+	int move_group = 0;
+
+	/* I
+	 * If some flag other than the ones defined in PERF_FLAG_ALL
+	 * is set, then return error (unrecognized flag)
+	 */
+	if (flags & ~PERF_FLAG_ALL)
+		return -EINVAL;
+
+	/* Do we allow access to perf_event_open(2) ? */
+	err = security_perf_event_open(attrptr, PERF_SECURITY_OPEN);
+	if (err)
+		return err;
+
+	if (!attrptr->exclude_kernel) {
+		err = perf_allow_kernel(attrptr);
+		if (err)
+			return err;
+	}
+
+	if (attrptr->namespaces) {
+		if (!perfmon_capable())
+			return -EACCES;
+	}
+
+	if (attrptr->freq) {
+		if (attrptr->sample_freq > sysctl_perf_event_sample_rate)
+			return -EINVAL;
+	} else {
+		if (attrptr->sample_period & (1ULL << 63))
+			return -EINVAL;
+	}
+
+	/* Only privileged users can get physical addresses */
+	if ((attrptr->sample_type & PERF_SAMPLE_PHYS_ADDR)) {
+		err = perf_allow_kernel(attrptr);
+		if (err)
+			return err;
+	}
+
+	/* REGS_INTR can leak data, lockdown must prevent this */
+	if (attrptr->sample_type & PERF_SAMPLE_REGS_INTR) {
+		err = security_locked_down(LOCKDOWN_PERF);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * In cgroup mode, the pid argument is used to pass the fd
+	 * opened to the cgroup directory in cgroupfs. The cpu argument
+	 * designates the cpu on which to monitor threads from that
+	 * cgroup.
+	 */
+	if ((flags & PERF_FLAG_PID_CGROUP) && (pid == -1 || cpu == -1))
+		return -EINVAL;
+
+	if (flags & PERF_FLAG_FD_CLOEXEC)
+		f_flags |= O_CLOEXEC;
+
+	event_fd = get_unused_fd_flags(f_flags);
+	if (event_fd < 0)
+		return event_fd;
+
+	if (group_fd != -1) {
+		err = perf_fget_light(group_fd, &group);
+		if (err)
+			goto err_fd;
+		group_leader = group.file->private_data;
+		if (flags & PERF_FLAG_FD_OUTPUT)
+			output_event = group_leader;
+		if (flags & PERF_FLAG_FD_NO_GROUP)
+			group_leader = NULL;
+	}
+
+	if (pid != -1 && !(flags & PERF_FLAG_PID_CGROUP)) {
+		task = find_lively_task_by_vpid(pid);
+		if (IS_ERR(task)) {
+			err = PTR_ERR(task);
+			goto err_group_fd;
+		}
+	}
+
+	if (task && group_leader &&
+	    group_leader->attr.inherit != attrptr->inherit) {
+		err = -EINVAL;
+		goto err_task;
+	}
+
+	if (flags & PERF_FLAG_PID_CGROUP)
+		cgroup_fd = pid;
+
+	event = perf_event_alloc(attrptr, cpu, task, group_leader, NULL,
+				 NULL, NULL, cgroup_fd);
+	if (IS_ERR(event)) {
+		err = PTR_ERR(event);
+		goto err_task;
+	}
+
+	if (is_sampling_event(event)) {
+		if (event->pmu->capabilities & PERF_PMU_CAP_NO_INTERRUPT) {
+			err = -EOPNOTSUPP;
+			goto err_alloc;
+		}
+	}
+
+	/*
+	 * Special case software events and allow them to be part of
+	 * any hardware group.
+	 */
+	pmu = event->pmu;
+
+	if (attrptr->use_clockid) {
+		err = perf_event_set_clock(event, attrptr->clockid);
+		if (err)
+			goto err_alloc;
+	}
+
+	if (pmu->task_ctx_nr == perf_sw_context)
+		event->event_caps |= PERF_EV_CAP_SOFTWARE;
+
+	if (task) {
+		err = down_read_interruptible(&task->signal->exec_update_lock);
+		if (err)
+			goto err_alloc;
+
+		/*
+		 * We must hold exec_update_lock across this and any potential
+		 * perf_install_in_context() call for this new event to
+		 * serialize against exec() altering our credentials (and the
+		 * perf_event_exit_task() that could imply).
+		 */
+		err = -EACCES;
+		if (!perf_check_permission(attrptr, task))
+			goto err_cred;
+	}
+
+	/*
+	 * Get the target context (task or percpu):
+	 */
+	ctx = find_get_context(task, event);
+	if (IS_ERR(ctx)) {
+		err = PTR_ERR(ctx);
+		goto err_cred;
+	}
+
+	mutex_lock(&ctx->mutex);
+
+	if (ctx->task == TASK_TOMBSTONE) {
+		err = -ESRCH;
+		goto err_locked;
+	}
+
+	if (!task) {
+		/*
+		 * Check if the @cpu we're creating an event for is online.
+		 *
+		 * We use the perf_cpu_context::ctx::mutex to serialize against
+		 * the hotplug notifiers. See perf_event_{init,exit}_cpu().
+		 */
+		struct perf_cpu_context *cpuctx = per_cpu_ptr(&perf_cpu_context, 
+				event->cpu);
+
+		if (!cpuctx->online) {
+			err = -ENODEV;
+			goto err_locked;
+		}
+	}
+
+	if (group_leader) {
+		err = -EINVAL;
+
+		/*
+		 * Do not allow a recursive hierarchy (this new sibling
+		 * becoming part of another group-sibling):
+		 */
+		if (group_leader->group_leader != group_leader)
+			goto err_locked;
+
+		/* All events in a group should have the same clock */
+		if (group_leader->clock != event->clock)
+			goto err_locked;
+
+		/*
+		 * Make sure we're both events for the same CPU;
+		 * grouping events for different CPUs is broken; since
+		 * you can never concurrently schedule them anyhow.
+		 */
+		if (group_leader->cpu != event->cpu)
+			goto err_locked;
+
+		/*
+		 * Make sure we're both on the same context; either task or cpu.
+		 */
+		if (group_leader->ctx != ctx)
+			goto err_locked;
+
+		/*
+		 * Only a group leader can be exclusive or pinned
+		 */
+		if (attrptr->exclusive || attrptr->pinned)
+			goto err_locked;
+
+		if (is_software_event(event) &&
+		    !in_software_context(group_leader)) {
+			/*
+			 * If the event is a sw event, but the group_leader
+			 * is on hw context.
+			 *
+			 * Allow the addition of software events to hw
+			 * groups, this is safe because software events
+			 * never fail to schedule.
+			 */
+			pmu = group_leader->pmu_ctx->pmu;
+		} else if (!is_software_event(event) &&
+			   is_software_event(group_leader) &&
+			   (group_leader->group_caps & PERF_EV_CAP_SOFTWARE)) {
+			/*
+			 * In case the group is a pure software group, and we
+			 * try to add a hardware event, move the whole group to
+			 * the hardware context.
+			 */
+			move_group = 1;
+		}
+
+		/* Don't allow group of multiple hw events from different pmus */
+		if (!in_software_context(group_leader) &&
+		    group_leader->pmu_ctx->pmu != pmu)
+			goto err_locked;
+	}
+
+	/*
+	 * Now that we're certain of the pmu; find the pmu_ctx.
+	 */
+	pmu_ctx = find_get_pmu_context(pmu, ctx, event);
+	if (IS_ERR(pmu_ctx)) {
+		err = PTR_ERR(pmu_ctx);
+		goto err_locked;
+	}
+	event->pmu_ctx = pmu_ctx;
+
+	if (output_event) {
+		err = perf_event_set_output(event, output_event);
+		if (err)
+			goto err_context;
+	}
+
+	if (!perf_event_validate_size(event)) {
+		err = -E2BIG;
+		goto err_context;
+	}
+
+	if (perf_need_aux_event(event) && !perf_get_aux_event(event, group_leader)) {
+		err = -EINVAL;
+		goto err_context;
+	}
+
+	/*
+	 * Must be under the same ctx::mutex as perf_install_in_context(),
+	 * because we need to serialize with concurrent event creation.
+	 */
+	if (!exclusive_event_installable(event, ctx)) {
+		err = -EBUSY;
+		goto err_context;
+	}
+
+	WARN_ON_ONCE(ctx->parent_ctx);
+
+	event_file = anon_inode_getfile("[perf_event]", &perf_fops, 
+			event, f_flags);
+	if (IS_ERR(event_file)) {
+		err = PTR_ERR(event_file);
+		event_file = NULL;
+		goto err_context;
+	}
+
+	if (ctx->task == TASK_TOMBSTONE) {
+		err = -ESRCH;
+		goto err_locked;
+	}
+
+	if (!perf_event_validate_size(event)) {
+		err = -E2BIG;
+		goto err_locked;
+	}
+
+
+
+	/*
+	 * This is the point on no return; we cannot fail hereafter.
+	 * This is where we start modifying current state.
+	 */
+
+	if (move_group) {
+		perf_remove_from_context(group_leader, 0);
+		put_pmu_ctx(group_leader->pmu_ctx);
+		for_each_sibling_event(sibling, group_leader) {
+			perf_remove_from_context(sibling, 0);
+			put_pmu_ctx(sibling->pmu_ctx);
+		}
+
+		/*
+		 * Install the group siblings before the group leader.
+		 *
+		 * Because a group leader will try and install the entire group
+		 * (through the sibling list, which is still in-tact), we can
+		 * end up with siblings installed in the wrong context.
+		 *
+		 * By installing siblings first we NO-OP because they're not
+		 * reachable through the group lists.
+		 */
+		for_each_sibling_event(sibling, group_leader) {
+			sibling->pmu_ctx = pmu_ctx;
+			get_pmu_ctx(pmu_ctx);
+			perf_event__state_init(sibling);
+			perf_install_in_context(ctx, sibling, sibling->cpu);
+		}
+		/*
+		 * Removing from the context ends up with disabled
+		 * event. What we want here is event in the initial
+		 * startup state, ready to be add into new context.
+		 */
+		group_leader->pmu_ctx = pmu_ctx;
+		get_pmu_ctx(pmu_ctx);
+		perf_event__state_init(group_leader);
+		perf_install_in_context(ctx, group_leader, group_leader->cpu);
+	}
+
+	/*
+	 * Precalculate sample_data sizes; do while holding ctx::mutex
+	 * such that we're serialized against further additions 
+	 * and before perf_install_in_context() which is the point
+	 * the event is active and can use these values.
+	 */
+	perf_event__header_size(event);
+	perf_event__id_header_size(event);
+	event->owner = current;
+	perf_install_in_context(ctx, event, event->cpu);
+	perf_unpin_context(ctx);
+	mutex_unlock(&ctx->mutex);
+
+	if (task) {
+		up_read(&task->signal->exec_update_lock);
+		put_task_struct(task);
+	}
+	mutex_lock(&current->perf_event_mutex);
+	list_add_tail(&event->owner_entry, &current->perf_event_list);
+	mutex_unlock(&current->perf_event_mutex);
+	/*
+	 * Drop the reference on the group_event after placing the
+	 * new event on the sibling_list. This ensures destruction
+	 * of the group leader will find the pointer to itself in
+	 * perf_group_detach().
+	 */
+	fdput(group);
+	fd_install(event_fd, event_file);
+	return event_fd;
+
+err_locked:
+	if (move_group)
+		perf_event_ctx_unlock(group_leader, gctx);
+	mutex_unlock(&ctx->mutex);
+err_cred:
+	if (task)
+		up_read(&task->signal->exec_update_lock);
+err_file:
+	fput(event_file);
+err_context:
+	perf_unpin_context(ctx);
+	put_ctx(ctx);
+err_alloc:
+	/*
+	 * If event_file is set, the fput() above will have called ->release()
+	 * and that will take care of freeing the event.
+	 */
+	if (!event_file)
+		free_event(event);
+err_task:
+	if (task)
+		put_task_struct(task);
+err_group_fd:
+	fdput(group);
+err_fd:
+	put_unused_fd(event_fd);
+	return err;
+}
+
+int bwtier_perf_event_init(struct perf_event *event, uint64_t sample_type,
+		uint64_t config, uint64_t cpu, uint32_t nr_pages)
+{
+	struct perf_event_attr attr;
+	struct perf_buffer *rb;
+	struct file *file;
+	int event_fd, ret = 0, flags = 0;
+	long wmark;
+
+	if (nr_pages != 0 && !is_power_of_2(nr_pages))
+		return -EINVAL;
+
+	memset(&attr, 0, sizeof(struct perf_event_attr));
+
+	attr.type = PERF_TYPE_RAW;
+	attr.size = sizeof(struct perf_event_attr);
+	attr.config = config;
+	attr.sample_period = 10007;
+	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID |
+			PERF_SAMPLE_TIME | PERF_SAMPLE_ADDR | PERF_SAMPLE_PHYS_ADDR;
+	attr.precise_ip = 1;
+
+	// bwtier_perf_event_open
+	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
+  if (event_fd <= 0) {
+		printk(KERN_ERR "[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
+		return -1;
+	}
+
+	file = fget(event_fd);
+	if (!file) {
+		printk("invalid file\n");
+		return -1;
+	}
+	event = fget(event_fd)->private_data;
+
+	if (event->cpu == -1 && event->attr.inherit)
+		return -EINVAL;
+
+	ret = security_perf_event_read(event);
+	if (ret)
+		return ret;
+    
+	WARN_ON_ONCE(event->ctx->parent_ctx);
+	mutex_lock(&event->mmap_mutex);
+	WARN_ON(event->rb);
+
+	wmark = event->attr.watermark ? event->attr.wakeup_watermark : 0;
+	rb = rb_alloc(nr_pages, wmark, event->cpu, flags);
+	if (!rb) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+    
+	ring_buffer_attach(event, rb);
+	perf_event_init_userpage(event);
+	perf_event_update_userpage(event);
+
+unlock:
+	if (!ret) {
+		atomic_inc(&event->mmap_count);
+	}
+	mutex_unlock(&event->mmap_mutex);
+	return ret;
+}
+
+#endif /* CONFIG_BWTIER */
+
 DEFINE_STATIC_CALL_RET0(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
