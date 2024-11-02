@@ -14373,7 +14373,7 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	attr.type = PERF_TYPE_RAW;
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = config;
-	attr.sample_period = 1007;
+	attr.sample_period = 100007;
 	attr.sample_type = sample_type;
 	attr.precise_ip = 1;
 	attr.disabled = 0;

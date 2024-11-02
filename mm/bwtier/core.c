@@ -129,12 +129,16 @@ static int ksampld(void *ksampld_args)
 					}
 
 					smp_mb();
+
+					/* ensure that when data_tail overflows the ring buffer bounds,
+					 * bring it back to the start of the ring buffer
+					 */
 					WRITE_ONCE(metapage->data_tail, data_tail + header->size);
 				}
 			}
 		}
 
-		// msleep(100);
+		msleep(25);
 	}
 
 	return 0;
@@ -182,6 +186,7 @@ static int ksampld_start(void)
 		}
 	}
 
+	msleep(100);
 	// printk(KERN_INFO "TIMER? NO WAY\n");
 	timer_init(1, 0);
 	// printk(KERN_INFO "kthread_run? \n");
@@ -198,8 +203,10 @@ static int ksampld_stop(void)
 		return 0;
 	}
 
-	kthread_stop(ksampld_task);
 	timer_cleanup();
+	printk(KERN_INFO "task:%lx evnt:%lx\n", ksampld_task, eventlist);
+	kthread_stop(ksampld_task);
+	msleep(100);
 	ksampld_task = NULL;
 
 	for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
