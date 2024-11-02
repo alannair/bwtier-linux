@@ -60,6 +60,9 @@
 
 #include <asm/irq_regs.h>
 
+static int bwtier_perf_event_open(struct perf_event_attr *attrptr, pid_t pid,
+	  int cpu, int group_fd, unsigned long flags);
+
 typedef int (*remote_function_f)(void *);
 
 struct remote_function_call {
@@ -12498,6 +12501,10 @@ SYSCALL_DEFINE5(perf_event_open,
 	if (err)
 		return err;
 
+	printk(KERN_INFO "bwtier_perf_event_open %d %d\n", pid, cpu);
+
+	return bwtier_perf_event_open(&attr, pid, cpu, group_fd, flags);
+
 	/* Do we allow access to perf_event_open(2) ? */
 	err = security_perf_event_open(&attr, PERF_SECURITY_OPEN);
 	if (err)
@@ -13945,7 +13952,7 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 
 #ifdef CONFIG_BWTIER
 
-static int bwtier_perf_event_open(struct perf_event_attr *attrptr,
+int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 		pid_t pid, int cpu, int group_fd, unsigned long flags)
 {
 	struct perf_event *group_leader = NULL;
@@ -14347,7 +14354,7 @@ err_fd:
 	return err;
 }
 
-int bwtier_perf_event_init(struct perf_event *event, uint64_t sample_type,
+int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 		uint64_t config, uint64_t cpu, uint32_t nr_pages)
 {
 	struct perf_event_attr attr;
@@ -14359,15 +14366,20 @@ int bwtier_perf_event_init(struct perf_event *event, uint64_t sample_type,
 	if (nr_pages != 0 && !is_power_of_2(nr_pages))
 		return -EINVAL;
 
+	// printk(KERN_ERR "HERE IN bwtier_perf_event_init\n");
+
 	memset(&attr, 0, sizeof(struct perf_event_attr));
 
 	attr.type = PERF_TYPE_RAW;
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = config;
-	attr.sample_period = 10007;
-	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID |
-			PERF_SAMPLE_TIME | PERF_SAMPLE_ADDR | PERF_SAMPLE_PHYS_ADDR;
+	attr.sample_period = 1007;
+	attr.sample_type = sample_type;
 	attr.precise_ip = 1;
+	attr.disabled = 0;
+	// attr.enable_on_exec = 1;
+
+	// printk(KERN_ERR "before perf_event_open\n");
 
 	// bwtier_perf_event_open
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
@@ -14376,40 +14388,46 @@ int bwtier_perf_event_init(struct perf_event *event, uint64_t sample_type,
 		return -1;
 	}
 
+	// printk(KERN_ERR "after perf_event_open %lu\n", event);
+
 	file = fget(event_fd);
 	if (!file) {
 		printk("invalid file\n");
 		return -1;
 	}
-	event = fget(event_fd)->private_data;
+	// printk(KERN_ERR "file: %lu\n", file);
+	*event = file->private_data;
 
-	if (event->cpu == -1 && event->attr.inherit)
+	// printk(KERN_ERR "*event\n");
+
+	if ((*event)->cpu == -1 && (*event)->attr.inherit)
 		return -EINVAL;
 
-	ret = security_perf_event_read(event);
+	ret = security_perf_event_read(*event);
 	if (ret)
 		return ret;
     
-	WARN_ON_ONCE(event->ctx->parent_ctx);
-	mutex_lock(&event->mmap_mutex);
-	WARN_ON(event->rb);
+	WARN_ON_ONCE((*event)->ctx->parent_ctx);
+	mutex_lock(&(*event)->mmap_mutex);
+	WARN_ON((*event)->rb);
 
-	wmark = event->attr.watermark ? event->attr.wakeup_watermark : 0;
-	rb = rb_alloc(nr_pages, wmark, event->cpu, flags);
+	wmark = (*event)->attr.watermark ? (*event)->attr.wakeup_watermark : 0;
+	rb = rb_alloc(nr_pages, wmark, (*event)->cpu, flags);
 	if (!rb) {
 		ret = -ENOMEM;
 		goto unlock;
 	}
+
     
-	ring_buffer_attach(event, rb);
-	perf_event_init_userpage(event);
-	perf_event_update_userpage(event);
+	ring_buffer_attach(*event, rb);
+	perf_event_init_userpage(*event);
+	perf_event_update_userpage(*event);
 
 unlock:
 	if (!ret) {
-		atomic_inc(&event->mmap_count);
+		atomic_inc(&(*event)->mmap_count);
 	}
-	mutex_unlock(&event->mmap_mutex);
+	mutex_unlock(&(*event)->mmap_mutex);
 	return ret;
 }
 

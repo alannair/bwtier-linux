@@ -1923,7 +1923,7 @@ static inline void perf_lopwr_cb(bool mode)
 #endif
 
 #ifdef CONFIG_BWTIER
-extern int bwtier_perf_event_init(struct perf_event *event, uint64_t sample_type,
+extern int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 		uint64_t config, uint64_t cpu, uint32_t nr_pages);
 #endif
 
