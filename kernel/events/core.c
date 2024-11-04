@@ -14332,8 +14332,8 @@ err_locked:
 err_cred:
 	if (task)
 		up_read(&task->signal->exec_update_lock);
-err_file:
-	fput(event_file);
+// err_file:
+// 	fput(event_file);
 err_context:
 	perf_unpin_context(ctx);
 	put_ctx(ctx);
@@ -14360,7 +14360,7 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	struct perf_event_attr attr;
 	struct perf_buffer *rb;
 	struct file *file;
-	int event_fd, ret = 0, flags = 0;
+	int event_fd, ret = 0;
 	long wmark;
 
 	if (nr_pages != 0 && !is_power_of_2(nr_pages))
@@ -14412,13 +14412,13 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	WARN_ON((*event)->rb);
 
 	wmark = (*event)->attr.watermark ? (*event)->attr.wakeup_watermark : 0;
-	rb = rb_alloc(nr_pages, wmark, (*event)->cpu, flags);
+	rb = rb_alloc(nr_pages, wmark, (*event)->cpu, 
+			RING_BUFFER_WRITABLE);
 	if (!rb) {
 		ret = -ENOMEM;
 		goto unlock;
 	}
 
-    
 	ring_buffer_attach(*event, rb);
 	perf_event_init_userpage(*event);
 	perf_event_update_userpage(*event);
