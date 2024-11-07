@@ -23,12 +23,27 @@
 
 #define SAMPLE_BATCH_SIZE 100
 #define BWTIER_NR_CPUS 96
-#define PEBS_BUF_PAGES_PER_CPUEVENT 512
+#define PEBS_BUF_PAGES_PER_CPUEVENT 512 // must be power of 2
+
+#define NUM_BWTIER_BINS 16
+#define COOLING_PERIOD_MS 1000
+
+struct access_hist_bin {
+	uint32_t bin_id;
+	uint32_t nr_pages;
+	struct list_head pages_head;
+};
 
 bool bwtier_status(void);
 int bwtier_enable(void);
 int bwtier_disable(void);
+int ksampld_enable(void);
+int ksampld_disable(void);
+
 void bwtier_set_cpu_bitmap(struct cpumask *mask);
 void bwtier_get_cpu_bitmap(struct cpumask *mask);
 void bwtier_enable_all_cpus(void);
 void bwtier_disable_all_cpus(void);
+
+void bwtier_core_init(void);
+void update_pginfo(uint64_t pfn, uint64_t timestamp);
