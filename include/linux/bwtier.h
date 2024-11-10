@@ -5,10 +5,13 @@
  * Copyright (c) 2024 Alan Nair <alannair1000@gmail.com>
  */
 
+#include <linux/bwtier_err.h>
+
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/memcontrol.h>
+#include <linux/mempolicy.h>
 #include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/interrupt.h>
@@ -29,9 +32,17 @@
 #define COOLING_PERIOD_MS 1000
 
 struct access_hist_bin {
-	uint32_t bin_id;
+	int bin_id; // unique ID, starts with 1
 	uint32_t nr_pages;
 	struct list_head pages_head;
+};
+
+/* Information about sampled page to be returned to ksampld
+ * for updating various counters and statistics.
+ */
+struct pginfo {
+	uint32_t bin_id;
+	uint32_t nid;
 };
 
 bool bwtier_status(void);
@@ -45,5 +56,6 @@ void bwtier_get_cpu_bitmap(struct cpumask *mask);
 void bwtier_enable_all_cpus(void);
 void bwtier_disable_all_cpus(void);
 
+void ksampld_init(void);
 void bwtier_core_init(void);
-void update_pginfo(uint64_t pfn, uint64_t timestamp);
+struct pginfo* update_pginfo(pid_t pid, uint64_t vaddr);

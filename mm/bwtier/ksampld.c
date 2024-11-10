@@ -16,9 +16,12 @@ struct perf_event **eventlist = NULL;
 struct task_struct *ksampld_task = NULL;
 static struct hrtimer htimer;
 static ktime_t kt_periode;
-atomic_t ndram, ncxl, nthrottled, nlost, nzero, nothers;
+atomic_t nall, ndram, ncxl, nthrottled, nlost, nzero, nothers;
 
-uint64_t BWTIER_EVENTS[] = { ALL_LOADS_EVENT, ALL_STORES_EVENT };
+uint64_t BWTIER_EVENTS[] = { 
+		LLC_MISS_LOADS_EVENT, 
+		STLB_MISS_STORES_EVENT 
+};
 
 /* 
  * Ensure that perf ring buffer size is a multiple of this struct's
@@ -27,18 +30,22 @@ uint64_t BWTIER_EVENTS[] = { ALL_LOADS_EVENT, ALL_STORES_EVENT };
  * For simplicity, just ensure that this struct's size is a power of 2.
  */
 uint64_t perf_sample_type = 
-		// PERF_SAMPLE_IP |
+		PERF_SAMPLE_IP |
 		PERF_SAMPLE_TID |
 		PERF_SAMPLE_TIME |
-		// PERF_SAMPLE_ADDR |
+		PERF_SAMPLE_ADDR |
+		PERF_SAMPLE_CPU |
+		PERF_SAMPLE_PERIOD |
 		PERF_SAMPLE_PHYS_ADDR;
 
 struct bwtier_sample {
 	struct perf_event_header header; // 8 bytes
-	// uint64_t ip;
+	uint64_t ip;
 	uint32_t pid, tid;
 	uint64_t time;
-	// uint64_t addr;
+	uint64_t addr;
+	uint32_t cpu, res;
+	uint64_t period;
 	uint64_t phys_addr;
 };
 
@@ -50,9 +57,10 @@ static enum hrtimer_restart timer_function(struct hrtimer *timer)
 	int n_lost = atomic_read(&nlost);
 	int n_zero = atomic_read(&nzero);
 	int n_others = atomic_read(&nothers);
+	int n_all = atomic_read(&nall);
 
-	printk(KERN_INFO "[KSAMPLD] DRAM:%d CXL:%d Thr:%d Lost:%d 0:%d Oth:%d\n",
-			n_dram, n_cxl, n_throttled, n_lost, n_zero, n_others);
+	printk(KERN_INFO "[KSAMPLD] %d DR:%d CX:%d Thr:%d Lost:%d 0:%d Oth:%d\n",
+			n_all, n_dram, n_cxl, n_throttled, n_lost, n_zero, n_others);
 
 	hrtimer_forward_now(timer, kt_periode);
 	return HRTIMER_RESTART;
@@ -66,9 +74,14 @@ static void timer_init(int secs, int nsecs)
 	atomic_set(&nlost, 0);
 	atomic_set(&nzero, 0);
 	atomic_set(&nothers, 0);
+	atomic_set(&nall, 0);
 
   kt_periode = ktime_set(secs, nsecs);
   hrtimer_init (&htimer, CLOCK_REALTIME, HRTIMER_MODE_REL);
+}
+
+static void timer_start(void)
+{
   htimer.function = timer_function;
   hrtimer_start(&htimer, kt_periode, HRTIMER_MODE_REL);
 }
@@ -92,8 +105,9 @@ static int ksampld(void *ksampld_args)
 	struct perf_event_mmap_page *metapage;
 	struct perf_event_header *header;
 	struct bwtier_sample *sample;
-	int event_id, pos, pgshift, nid, iterct, cpu;
-	uint64_t data_head, data_tail, pgindex, offset, pfn;
+	struct pginfo *pginfo;
+	int event_id, pos, pgshift, iterct, cpu;
+	uint64_t data_head, data_tail, pgindex, offset;
 
 	while (!kthread_should_stop()) {
 		for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
@@ -128,25 +142,24 @@ static int ksampld(void *ksampld_args)
 
 					header = (struct perf_event_header *)((char *)
 							(rb->data_pages[pgindex]) + offset);
+					atomic_inc(&nall);
 
 					switch (header->type) {
 						case PERF_RECORD_SAMPLE:
 							sample = (struct bwtier_sample *)header;
-							pfn = sample->phys_addr >> PAGE_SHIFT;
-							if (!pfn) {
+							pginfo = update_pginfo(sample->pid, sample->addr);
+							if (!pginfo) {
 								atomic_inc(&nzero);
-								continue;
-							}
-							nid = pfn_to_nid(pfn);
-
-							if (nid < 2) {
+							} else if (pginfo->nid == 0 || pginfo->nid == 1) {
 								/* DRAM Address */
 								atomic_inc(&ndram);
-							} else {
+							} else if (pginfo->nid == 2 || pginfo->nid == 3) {
 								/* CXL Address */
 								atomic_inc(&ncxl);
+							} else {
+								/* Other Address */
+								atomic_inc(&nothers);
 							}
-							update_pginfo(pfn, sample->time);
 							break;
 
 						case PERF_RECORD_THROTTLE:
@@ -195,7 +208,6 @@ static int ksampld_start(void)
 				perf_event_enable(eventlist[pos]);
 			}
 		}
-		printk(KERN_INFO "Outta the loop\n");
 	} else {
 		for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
 			cpu = -1;
@@ -207,7 +219,7 @@ static int ksampld_start(void)
 	}
 
 	msleep(100);
-	timer_init(0, 1e+7);
+	timer_start();
 	ksampld_task = kthread_run(ksampld, NULL, "ksampld");
 	return ret;
 }
@@ -236,6 +248,11 @@ static int ksampld_stop(void)
 	}
 
 	return 0;
+}
+
+void ksampld_init(void)
+{
+	timer_init(0, 1e+8);
 }
 
 bool bwtier_status(void)

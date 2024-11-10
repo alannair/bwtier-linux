@@ -141,6 +141,7 @@ static int __init bwtier_debugfs_init(void)
 	debugfs_create_file("cpus", 0600, bwtier_sysfs_root, 
 		NULL, &bwtier_debugfs_cpus_fops);
 
+	ksampld_init();
 	bwtier_core_init();
 
 	return 0;

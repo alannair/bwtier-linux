@@ -218,7 +218,7 @@ struct page {
 #endif
 
 #ifdef CONFIG_BWTIER
-	uint32_t bin_id;
+	int bin_id;
 	uint32_t access_count;
 	uint64_t last_cooled_timestamp;
 	struct list_head bwtier_list;
