@@ -7,32 +7,29 @@
 
 #include <linux/bwtier.h>
 
-/*
- * TODO: 
- * Make oldest_bin_index atomic
- * Make access_histogram_bins lock-protected
- */
-
 struct access_hist_bin access_histogram_bins[NUM_BWTIER_BINS];
-int oldest_bin_index = 0; /* increment on COOLING */
+static atomic_t oldest_bin_index; /* increment on COOLING */
 static struct hrtimer htimer;
 static ktime_t kt_periode;
+static atomic_t cool_ms;
 
 static int bin_index_from_access_count(int access_count)
 {
 	int x = ilog2(access_count);
+	int index = atomic_read(&oldest_bin_index);
 
 	if (x >= NUM_BWTIER_BINS)
 		x = NUM_BWTIER_BINS - 1;
 
-	return (x + oldest_bin_index) % NUM_BWTIER_BINS;
+	return (x + index) % NUM_BWTIER_BINS;
 }
 
 static int bin_index_from_bin_id(int bin_id)
 {
-	int oldest_bin_id = access_histogram_bins[oldest_bin_index].bin_id;
+	int oldest_bin_index_val = atomic_read(&oldest_bin_index);
+	int oldest_bin_id = access_histogram_bins[oldest_bin_index_val].bin_id;
 	int diff = bin_id - oldest_bin_id;
-	int index = (diff + oldest_bin_index) % NUM_BWTIER_BINS;
+	int index = (diff + oldest_bin_index_val) % NUM_BWTIER_BINS;
 
 	if (diff < 0)
 		return -ERR_BWTIER_INVAL_BININDEX;
@@ -48,35 +45,37 @@ static int bin_index_from_bin_id(int bin_id)
 
 static void cool_once(void)
 {
-	int oldest_bin_id = access_histogram_bins[oldest_bin_index].bin_id;
+	int oldest_bin_index_val = atomic_read(&oldest_bin_index);
+	int oldest_bin_id = access_histogram_bins[oldest_bin_index_val].bin_id;
 	int new_bin_id = oldest_bin_id + NUM_BWTIER_BINS;
-	struct list_head *lh1, *lh2;
+	struct list_head *headnext, *headnextnext;
 
-	list_for_each_safe(lh1, lh2,
-			&(access_histogram_bins[oldest_bin_index].pages_head)) {
-		list_del(lh1);
+	list_for_each_safe(headnext, headnextnext,
+			&(access_histogram_bins[oldest_bin_index_val].pages_head)) {
+		list_del(headnext);
 	}
 
-	access_histogram_bins[oldest_bin_index].nr_pages = 0;
-	access_histogram_bins[oldest_bin_index].bin_id = new_bin_id;
-	oldest_bin_index = (oldest_bin_index + 1) % NUM_BWTIER_BINS;
+	access_histogram_bins[oldest_bin_index_val].nr_pages = 0;
+	access_histogram_bins[oldest_bin_index_val].bin_id = new_bin_id;
+	oldest_bin_index_val = (oldest_bin_index_val + 1) % NUM_BWTIER_BINS;
+	atomic_set(&oldest_bin_index, oldest_bin_index_val);
 
 	printk(KERN_INFO "Cooled Once %d\n", oldest_bin_index);
 }
 
-static enum hrtimer_restart do_cooling(struct hrtimer *timer)
+static enum hrtimer_restart do_lazy_cooling(struct hrtimer *timer)
 {
 	cool_once();
 	hrtimer_forward_now(timer, kt_periode);
 	return HRTIMER_RESTART;
 }
 
-static void periodic_cooling_enable(void)
+static void lazy_cooling_enable(void)
 {
 	hrtimer_start(&htimer, kt_periode, HRTIMER_MODE_REL);
 }
 
-static void periodic_cooling_disable(void)
+static void lazy_cooling_disable(void)
 {
   hrtimer_cancel(&htimer);
 }
@@ -85,6 +84,9 @@ void bwtier_core_init(void)
 {
 	int i;
 	int cool_secs, cool_nsecs;
+
+	atomic_set(&cool_ms, COOLING_PERIOD_MS);
+	atomic_set(&oldest_bin_index, 0);
 
 	cool_secs = COOLING_PERIOD_MS / 1000;
 	cool_nsecs = (COOLING_PERIOD_MS % 1000) * 1000000;
@@ -98,7 +100,7 @@ void bwtier_core_init(void)
 
 	kt_periode = ktime_set(cool_secs, cool_secs);
 	hrtimer_init(&htimer, CLOCK_REALTIME, HRTIMER_MODE_REL);
-	htimer.function = do_cooling;
+	htimer.function = do_lazy_cooling;
 }
 
 static struct pginfo* update_base_page(struct vm_area_struct *vma, 
@@ -106,7 +108,8 @@ static struct pginfo* update_base_page(struct vm_area_struct *vma,
 {
 	int bin_id, pg_bin_id, bin_index, pg_bin_index;
 	uint64_t pg_acc_count, pg_last_cooled_ts;
-	uint64_t cool_period_jiff = (HZ * COOLING_PERIOD_MS) / 1000;
+	int cool_period_ms = atomic_read(&cool_ms);
+	uint64_t cool_period_jiff = (HZ * cool_period_ms) / 1000;
 	struct pginfo *pginfo = kzalloc(sizeof(struct pginfo), GFP_KERNEL); 
 
 	/* LOCK PAGE */
@@ -291,16 +294,32 @@ put_task:
 	return pginfo;
 }
 
+int bwtier_cool_ms(void)
+{
+	return atomic_read(&cool_ms);
+}
+
+int set_bwtier_cool_ms(int ms)
+{
+	int secs, nsecs;
+
+	atomic_set(&cool_ms, ms);
+	secs = ms / 1000;
+	nsecs = (ms % 1000) * 1000000;
+  kt_periode = ktime_set(secs, nsecs);
+	return 0;
+}
+
 int bwtier_enable(void)
 {
-	periodic_cooling_enable();
+	lazy_cooling_enable();
 	ksampld_enable();
 	return 0;
 }
 
 int bwtier_disable(void)
 {
-	periodic_cooling_disable();
+	lazy_cooling_disable();
 	ksampld_disable();
 	return 0;
 }

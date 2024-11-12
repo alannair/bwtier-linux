@@ -3,9 +3,17 @@
 menu "Memory Bandwidth Tiering"
 
 config BWTIER
-	bool "BWTIER: Memory Bandwidth Tiering"
+	bool "BWTIER: Memory Bandwidth Tiering Page Tracking"
 	depends on NUMA && PERF_USE_VMALLOC
 	help
 		Enables CXL-based Memory Bandwidth Tiering Support.
+		Enabling this without Migration Support will produce statistics and
+		page access tracking.
+
+config BWTIER_MIGRATE
+	bool "BWTIER: Memory Bandwidth Tiering Page Migration"
+	depends on BWTIER
+	help
+		Enables CXL-based Memory Bandwidth Tiering Page Migration Support.
 
 endmenu

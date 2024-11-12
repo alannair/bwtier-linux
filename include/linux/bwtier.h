@@ -5,7 +5,7 @@
  * Copyright (c) 2024 Alan Nair <alannair1000@gmail.com>
  */
 
-#include <linux/bwtier_err.h>
+#include <linux/bwtier_macros.h>
 
 #include <linux/cpumask.h>
 #include <linux/delay.h>
@@ -17,19 +17,6 @@
 #include <linux/interrupt.h>
 #include <linux/hrtimer.h>
 #include <linux/vmalloc.h>
-
-#define ALL_LOADS_EVENT 0x81d0
-#define ALL_STORES_EVENT 0x82d0
-#define LLC_MISS_LOADS_EVENT  0x20d1
-#define STLB_MISS_STORES_EVENT 0x12d0
-#define NUM_BWTIER_EVENTS 2
-
-#define SAMPLE_BATCH_SIZE 100
-#define BWTIER_NR_CPUS 96
-#define PEBS_BUF_PAGES_PER_CPUEVENT 512 // must be power of 2
-
-#define NUM_BWTIER_BINS 16
-#define COOLING_PERIOD_MS 1000
 
 struct access_hist_bin {
 	int bin_id; // unique ID, starts with 1
@@ -50,6 +37,17 @@ int bwtier_enable(void);
 int bwtier_disable(void);
 int ksampld_enable(void);
 int ksampld_disable(void);
+int bwtier_cool_ms(void);
+int set_bwtier_cool_ms(int ms);
+int bwtier_stats_ms(void);
+int set_bwtier_stats_ms(int ms);
+void clear_bwtier_pids(void);
+pid_t *get_pid_list(int *npids);
+void bwtier_set_pid(pid_t pid);
+int bwtier_get_pebsfreq(void);
+int bwtier_set_pebsfreq(int freq);
+int bwtier_get_pages_per_cpuevent(void);
+int bwtier_set_pages_per_cpuevent(uint32_t pages);
 
 void bwtier_set_cpu_bitmap(struct cpumask *mask);
 void bwtier_get_cpu_bitmap(struct cpumask *mask);

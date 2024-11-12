@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BWTIER API
+ *
+ * Copyright (c) 2024 Alan Nair <alannair1000@gmail.com>
+ */
+
+#define ALL_LOADS_EVENT 0x81d0
+#define ALL_STORES_EVENT 0x82d0
+#define LLC_MISS_LOADS_EVENT  0x20d1
+#define STLB_MISS_STORES_EVENT 0x12d0
+#define NUM_BWTIER_EVENTS 2
+
+#define SAMPLE_BATCH_SIZE 100
+#define BWTIER_NR_CPUS 96
+#define MAX_PAGES_PER_CPUEVENT 1024 // must be power of 2
+
+#define NUM_BWTIER_BINS 16
+#define COOLING_PERIOD_MS 1000
+
+#define MIN_PEBS_FREQ 100
+#define MAX_PEBS_FREQ 25000
+#define MAX_PIDS 64
+
+/* ERRORS */
+#define ERR_BWTIER_INVAL_BININDEX 101
+#define ERR_BWTIER_RANGE 102
+
+#define ERR_UNRECOVERABLE 900
+#define ERR_INCOMPREHENSIBLE 999

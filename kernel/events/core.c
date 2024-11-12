@@ -14355,7 +14355,7 @@ err_fd:
 }
 
 int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
-		uint64_t config, uint64_t cpu, uint32_t nr_pages)
+		uint64_t config, uint64_t cpu, uint32_t nr_pages, uint64_t freq)
 {
 	struct perf_event_attr attr;
 	struct perf_buffer *rb;
@@ -14366,39 +14366,30 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	if (nr_pages != 0 && !is_power_of_2(nr_pages))
 		return -EINVAL;
 
-	// printk(KERN_ERR "HERE IN bwtier_perf_event_init\n");
-
 	memset(&attr, 0, sizeof(struct perf_event_attr));
 
 	attr.type = PERF_TYPE_RAW;
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = config;
-	attr.sample_period = 1007;
+	attr.sample_freq = freq;
 	attr.sample_type = sample_type;
 	attr.precise_ip = 1;
 	attr.disabled = 0;
-	// attr.enable_on_exec = 1;
+	attr.freq = 1;
+	// attr.clockid = CLOCK_REALTIME;
 
-	// printk(KERN_ERR "before perf_event_open\n");
-
-	// bwtier_perf_event_open
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
   if (event_fd <= 0) {
 		printk(KERN_ERR "[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
 		return -1;
 	}
 
-	// printk(KERN_ERR "after perf_event_open %lu\n", event);
-
 	file = fget(event_fd);
 	if (!file) {
 		printk("invalid file\n");
 		return -1;
 	}
-	// printk(KERN_ERR "file: %lu\n", file);
 	*event = file->private_data;
-
-	// printk(KERN_ERR "*event\n");
 
 	if ((*event)->cpu == -1 && (*event)->attr.inherit)
 		return -EINVAL;
