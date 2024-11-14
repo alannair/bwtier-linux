@@ -13970,8 +13970,7 @@ int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 	int f_flags = O_RDWR;
 	int move_group = 0;
 
-	/* I
-	 * If some flag other than the ones defined in PERF_FLAG_ALL
+	/* If some flag other than the ones defined in PERF_FLAG_ALL
 	 * is set, then return error (unrecognized flag)
 	 */
 	if (flags & ~PERF_FLAG_ALL)
@@ -14235,6 +14234,7 @@ int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 
 	WARN_ON_ONCE(ctx->parent_ctx);
 
+	printk(KERN_ERR "perf_event_open event: %llx %d\n", (uint64_t)event, f_flags);
 	event_file = anon_inode_getfile("[perf_event]", &perf_fops, 
 			event, f_flags);
 	if (IS_ERR(event_file)) {
@@ -14242,6 +14242,7 @@ int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 		event_file = NULL;
 		goto err_context;
 	}
+	printk("OUT\n");
 
 	if (ctx->task == TASK_TOMBSTONE) {
 		err = -ESRCH;
@@ -14374,9 +14375,9 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	attr.sample_freq = freq;
 	attr.sample_type = sample_type;
 	attr.precise_ip = 1;
-	attr.disabled = 0;
+	attr.disabled = 1;
 	attr.freq = 1;
-	// attr.clockid = CLOCK_REALTIME;
+	attr.clockid = CLOCK_REALTIME;
 
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
   if (event_fd <= 0) {
@@ -14420,6 +14421,80 @@ unlock:
 	}
 	mutex_unlock(&(*event)->mmap_mutex);
 	return ret;
+}
+
+int bwtier_perf_counter_init(struct perf_event **event, uint64_t config,
+		uint64_t cpu)
+{
+	struct perf_event_attr attr;
+	struct perf_buffer *rb;
+	int event_fd, ret;
+	struct file *file;
+	long wmark, nr_pages = 1;
+
+	memset(&attr, 0, sizeof(struct perf_event_attr));
+
+	attr.type = PERF_TYPE_HW_CACHE;
+	attr.size = sizeof(struct perf_event_attr);
+	attr.config = config;
+	attr.disabled = 0;
+	attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | \
+			PERF_FORMAT_TOTAL_TIME_RUNNING;
+
+	printk(KERN_ERR "BEFORE %llu\n", cpu);
+	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
+	if (event_fd <= 0) {
+		printk(KERN_ERR 
+				"[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
+		return -1;
+	}
+	printk(KERN_ERR "AFTER\n");
+
+	file = fget(event_fd);
+	if (!file) {
+		printk("invalid file\n");
+		return -1;
+	}
+	*event = file->private_data;
+
+	if ((*event)->cpu == -1 && (*event)->attr.inherit)
+		return -EINVAL;
+
+	ret = security_perf_event_read(*event);
+	if (ret)
+		return ret;
+    
+	WARN_ON_ONCE((*event)->ctx->parent_ctx);
+	mutex_lock(&(*event)->mmap_mutex);
+	WARN_ON((*event)->rb);
+
+	wmark = (*event)->attr.watermark ? (*event)->attr.wakeup_watermark : 0;
+	rb = rb_alloc(nr_pages, wmark, (*event)->cpu, 
+			RING_BUFFER_WRITABLE);
+	if (!rb) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	ring_buffer_attach(*event, rb);
+	perf_event_init_userpage(*event);
+	perf_event_update_userpage(*event);
+
+unlock:
+	if (!ret) {
+		atomic_inc(&(*event)->mmap_count);
+	}
+	mutex_unlock(&(*event)->mmap_mutex);
+
+	return ret;
+}
+
+uint64_t bwtier_perf_counter_read(struct perf_event *event,
+		uint64_t *enabled, uint64_t *running)
+{
+	if (event->state == PERF_EVENT_STATE_ERROR)
+		return 999;
+	return __perf_event_read_value(event, enabled, running);
 }
 
 #endif /* CONFIG_BWTIER */

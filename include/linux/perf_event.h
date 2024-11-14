@@ -1925,6 +1925,10 @@ static inline void perf_lopwr_cb(bool mode)
 #ifdef CONFIG_BWTIER
 extern int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 		uint64_t config, uint64_t cpu, uint32_t nr_pages, uint64_t freq);
+extern int bwtier_perf_counter_init(struct perf_event **event, uint64_t config,
+		uint64_t cpu);
+extern uint64_t bwtier_perf_counter_read(struct perf_event *event,
+		uint64_t *enabled, uint64_t *running);
 #endif
 
 #endif /* _LINUX_PERF_EVENT_H */

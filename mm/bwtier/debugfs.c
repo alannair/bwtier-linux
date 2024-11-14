@@ -445,8 +445,8 @@ static int __init bwtier_debugfs_init(void)
 	debugfs_create_file("cool_ms", 0600,
 		bwtier_sysfs_root, NULL, &bwtier_debugfs_cool_ms_fops);
 
-	ksampld_init();
 	bwtier_core_init();
+	ksampld_init();
 
 	return 0;
 }

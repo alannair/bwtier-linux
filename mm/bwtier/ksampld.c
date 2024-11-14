@@ -6,12 +6,12 @@
  */
 
 #include <linux/bwtier.h>
-#include <linux/perf_event.h>
 
 #include "../../kernel/events/internal.h"
 
 struct cpumask cpu_bitmap;
 struct perf_event **eventlist = NULL;
+struct perf_event **counterlist = NULL;
 struct task_struct *ksampld_task = NULL;
 
 static struct hrtimer htimer;
@@ -24,35 +24,13 @@ atomic_t pebsfreq, stats_ms;
 atomic_t ntracked_pids;
 pid_t *tracked_pids = NULL;
 
-uint64_t BWTIER_EVENTS[] = { 
+const uint64_t BWTIER_EVENTS[] = { 
 		LLC_MISS_LOADS_EVENT, 
 		STLB_MISS_STORES_EVENT 
 };
-
-/* 
- * Ensure that perf ring buffer size is a multiple of this struct's
- * size. Else, the samples at the end of the buffer will be split
- * across buffer's end and start.
- * For simplicity, just ensure that this struct's size is a power of 2.
- */
-uint64_t perf_sample_type = 
-		PERF_SAMPLE_IP |
-		PERF_SAMPLE_TID |
-		PERF_SAMPLE_TIME |
-		PERF_SAMPLE_ADDR |
-		PERF_SAMPLE_CPU |
-		PERF_SAMPLE_PERIOD |
-		PERF_SAMPLE_PHYS_ADDR;
-
-struct bwtier_sample {
-	struct perf_event_header header; // 8 bytes
-	uint64_t ip;
-	uint32_t pid, tid;
-	uint64_t time;
-	uint64_t addr;
-	uint32_t cpu, res;
-	uint64_t period;
-	uint64_t phys_addr;
+const uint64_t BWTIER_COUNTERS[] = {
+		LLC_MISS_LOADS_COUNTER,
+		LLC_MISS_STORES_COUNTER
 };
 
 static bool pid_is_tracked(pid_t pid)
@@ -71,8 +49,10 @@ static bool pid_is_tracked(pid_t pid)
 	return false;
 }
 
-static enum hrtimer_restart timer_function(struct hrtimer *timer)
+static enum hrtimer_restart print_stats(struct hrtimer *timer)
 {
+	int event_id, cpu, pos;
+	uint64_t val, enabled, running;
 	int n_dram = atomic_read(&ndram);
 	int n_cxl = atomic_read(&ncxl);
 	int n_throttled = atomic_read(&nthrottled);
@@ -84,13 +64,26 @@ static enum hrtimer_restart timer_function(struct hrtimer *timer)
 	printk(KERN_INFO "[KSAMPLD] %d DR:%d CX:%d Thr:%d Lost:%d 0:%d Oth:%d\n",
 			n_all, n_dram, n_cxl, n_throttled, n_lost, n_zero, n_others);
 
+	for (event_id = 0; event_id < NUM_BWTIER_COUNTERS; event_id++) {
+		cpu = -1;
+		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
+			pos = event_id * BWTIER_NR_CPUS + cpu;
+			if (counterlist[pos]) {
+				val = bwtier_perf_counter_read(counterlist[pos], &enabled, &running);
+				printk(KERN_INFO "[KSAMPLD] Counter[%d] CPU[%d] Val:%llu (%llu/%llu)\n",
+						event_id, cpu, val, running, enabled);
+			}
+		}
+	}
+
 	hrtimer_forward_now(timer, kt_periode);
 	return HRTIMER_RESTART;
 }
 
-static void timer_init(void)
+static void enable_printstats(void)
 {
-	int secs, nsecs, stats_period_ms = atomic_read(&stats_ms);
+	int secs, stats_period_ms = atomic_read(&stats_ms);
+	uint64_t nsecs;
 
 	atomic_set(&ndram, 0);
 	atomic_set(&ncxl, 0);
@@ -101,18 +94,16 @@ static void timer_init(void)
 	atomic_set(&nall, 0);
 
 	secs = stats_period_ms / 1000;
-	nsecs = (stats_period_ms % 1000) * 1000000;
+	nsecs = (uint64_t)(stats_period_ms % 1000) * 1000000;
   kt_periode = ktime_set(secs, nsecs);
   hrtimer_init (&htimer, CLOCK_REALTIME, HRTIMER_MODE_REL);
-}
-
-static void timer_start(void)
-{
-  htimer.function = timer_function;
+  htimer.function = print_stats;
   hrtimer_start(&htimer, kt_periode, HRTIMER_MODE_REL);
+
+	printk(KERN_INFO "[KSAMPLD] Printing Stats %d %llu\n", secs, nsecs);
 }
 
-static void timer_cleanup(void)
+static void disable_printstats(void)
 {
   hrtimer_cancel(&htimer);
 }
@@ -122,12 +113,11 @@ static void timer_cleanup(void)
  * 1. We assume that a sampled entry from PEBS is read immediately
  * 	  by ksampld. Ensure that (data_head - data_tail) <= CONST.
  *    If this gets violated, lower perf period.
- * 2. Control the CPU overhead of ksampld. For this lower both the
+ *    Control the CPU overhead of ksampld. For this lower both the
  *    perf period and introduce sleep in the ksampld loop.
- * 3. Develop timer into a statistics accumulation and aggregation unit.
- * 4. Sys Interfaces for perf buffer size, frequency, pidfilter, stats period,
- *    cooling period, etc.
- * 5. Check all sysctl limits of perf
+ * 2. Develop timer into a statistics accumulation and aggregation unit.
+ *    Introduce perf event counters for LLC misses (load and store).
+ *    Use the counter values to weight the samples.
  */
 static int ksampld(void *ksampld_args)
 {
@@ -161,7 +151,7 @@ static int ksampld(void *ksampld_args)
 				for (iterct = 0; iterct < SAMPLE_BATCH_SIZE; iterct++) {
 					data_tail = READ_ONCE(metapage->data_tail);
 					if (data_head == data_tail) {
-				    break;
+						break;
 					}
 
 					smp_rmb(); /* read barrier */
@@ -178,7 +168,7 @@ static int ksampld(void *ksampld_args)
 						case PERF_RECORD_SAMPLE:
 							sample = (struct bwtier_sample *)header;
 							if (pid_is_tracked(sample->pid)) {
-								pginfo = update_pginfo(sample->pid, sample->addr);
+								pginfo = update_pginfo(sample);
 								if (!pginfo) {
 									atomic_inc(&nzero);
 								} else if (pginfo->nid == 0 || pginfo->nid == 1) {
@@ -221,22 +211,22 @@ static int ksampld(void *ksampld_args)
 
 static int ksampld_start(void)
 {
-	int pos = 0, ret = 0, cpu, event_id;
+	int pos = 0, cpu, event_id, ret;
 	int perfpages = atomic_read(&pages_per_cpuevent);
 	int freq = atomic_read(&pebsfreq);
 
-	if (ksampld_task) {
+	if (ksampld_task)
 		return 0;
-	}
 
 	if (!eventlist) {
-		eventlist = vzalloc(sizeof(struct perf_event *) * BWTIER_NR_CPUS * NUM_BWTIER_EVENTS);
+		eventlist = vzalloc(sizeof(struct perf_event *) *
+				BWTIER_NR_CPUS * NUM_BWTIER_EVENTS);
 
 		for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
 			cpu = -1;
 			while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
 				pos = event_id * BWTIER_NR_CPUS + cpu;
-				ret = bwtier_perf_event_init(eventlist + pos, perf_sample_type,
+				ret = bwtier_perf_event_init(eventlist + pos, PERF_SAMPLE_TYPE,
 						BWTIER_EVENTS[event_id], cpu, perfpages, freq);
 				if (ret) {
 					printk(KERN_ERR "perf_init ret:%d cpu:%d\n", ret, cpu);
@@ -249,26 +239,53 @@ static int ksampld_start(void)
 			cpu = -1;
 			while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
 				pos = event_id * BWTIER_NR_CPUS + cpu;
-				perf_event_enable(eventlist[pos]);
+				if (eventlist[pos])
+					perf_event_enable(eventlist[pos]);
+			}
+		}
+	}
+
+	if (!counterlist) {
+		counterlist = vzalloc(sizeof(struct perf_event *) *
+				BWTIER_NR_CPUS * NUM_BWTIER_COUNTERS);
+
+		for (event_id = 0; event_id < NUM_BWTIER_COUNTERS; event_id++) {
+			cpu = -1;
+			while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
+				pos = event_id * BWTIER_NR_CPUS + cpu;
+				ret = bwtier_perf_counter_init(counterlist + pos, 
+						BWTIER_COUNTERS[event_id], cpu);
+				if (ret) {
+					printk(KERN_ERR "perf_ctr_init ret:%d cpu:%d\n", ret, cpu);
+				}
+			}
+		}
+	} else {
+		for (event_id = 0; event_id < NUM_BWTIER_COUNTERS; event_id++) {
+			cpu = -1;
+			while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
+				pos = event_id * BWTIER_NR_CPUS + cpu;
+				if (counterlist[pos])
+					perf_event_enable(counterlist[pos]);
 			}
 		}
 	}
 
 	msleep(100);
-	timer_start();
+	enable_printstats();
 	ksampld_task = kthread_run(ksampld, NULL, "ksampld");
-	return ret;
+	return 0;
 }
 
 static int ksampld_stop(void)
 {
-	int event_id, pos, cpu;
+	int pos = 0, cpu, event_id;
 
 	if (!ksampld_task) {
 		return 0;
 	}
 
-	timer_cleanup();
+	disable_printstats();
 	kthread_stop(ksampld_task);
 	msleep(100);
 	ksampld_task = NULL;
@@ -277,9 +294,17 @@ static int ksampld_stop(void)
 		cpu = -1;
 		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
 			pos = event_id * BWTIER_NR_CPUS + cpu;
-			if (eventlist[pos]) {
+			if (eventlist[pos])
 				perf_event_disable(eventlist[pos]);		
-			}
+		}
+	}
+
+	for (event_id = 0; event_id < NUM_BWTIER_COUNTERS; event_id++) {
+		cpu = -1;
+		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
+			pos = event_id * BWTIER_NR_CPUS + cpu;
+			if (counterlist[pos])
+				perf_event_disable(counterlist[pos]);
 		}
 	}
 
@@ -288,15 +313,17 @@ static int ksampld_stop(void)
 
 void ksampld_init(void)
 {
+	int perfpages = MAX_PAGES_PER_CPUEVENT / 4;
+	int freq = 1000;
+
 	atomic_set(&ksampld_status_var, 0);
-	atomic_set(&pages_per_cpuevent,
-		MAX_PAGES_PER_CPUEVENT / 4);
-	atomic_set(&pebsfreq, 1000);
+	atomic_set(&pages_per_cpuevent, perfpages);
+	atomic_set(&pebsfreq, freq);
 	atomic_set(&stats_ms, 100);
 	atomic_set(&ntracked_pids, 0);
 
+	bwtier_enable_all_cpus();
 	tracked_pids = kzalloc(sizeof(pid_t) * MAX_PIDS, GFP_KERNEL);
-	timer_init();
 }
 
 bool bwtier_status(void)
@@ -410,7 +437,7 @@ pid_t* get_pid_list(int *npids)
 void bwtier_set_pid(pid_t pid)
 {
 	int npids = atomic_read(&ntracked_pids);
-	if (npids == MAX_PIDS)
+	if (npids == MAX_PIDS || pid <= 0)
 		return;
 
 	tracked_pids[npids] = pid;

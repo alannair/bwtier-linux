@@ -54,13 +54,13 @@ static void cool_once(void)
 			&(access_histogram_bins[oldest_bin_index_val].pages_head)) {
 		list_del(headnext);
 	}
-
+  
 	access_histogram_bins[oldest_bin_index_val].nr_pages = 0;
 	access_histogram_bins[oldest_bin_index_val].bin_id = new_bin_id;
 	oldest_bin_index_val = (oldest_bin_index_val + 1) % NUM_BWTIER_BINS;
 	atomic_set(&oldest_bin_index, oldest_bin_index_val);
 
-	printk(KERN_INFO "Cooled Once %d\n", oldest_bin_index);
+	printk(KERN_INFO "Cooled Once %d\n", oldest_bin_index_val);
 }
 
 static enum hrtimer_restart do_lazy_cooling(struct hrtimer *timer)
@@ -90,7 +90,6 @@ void bwtier_core_init(void)
 
 	cool_secs = COOLING_PERIOD_MS / 1000;
 	cool_nsecs = (COOLING_PERIOD_MS % 1000) * 1000000;
-	bwtier_enable_all_cpus();
 
 	for (i = 0; i < NUM_BWTIER_BINS; i++) {
 		access_histogram_bins[i].nr_pages = 0;
@@ -104,12 +103,11 @@ void bwtier_core_init(void)
 }
 
 static struct pginfo* update_base_page(struct vm_area_struct *vma, 
-		struct page *page) 
+		struct page *page, uint64_t timestamp) 
 {
 	int bin_id, pg_bin_id, bin_index, pg_bin_index;
 	uint64_t pg_acc_count, pg_last_cooled_ts;
-	int cool_period_ms = atomic_read(&cool_ms);
-	uint64_t cool_period_jiff = (HZ * cool_period_ms) / 1000;
+	uint64_t cool_period_ns = (uint64_t)atomic_read(&cool_ms) * 1000000;
 	struct pginfo *pginfo = kzalloc(sizeof(struct pginfo), GFP_KERNEL); 
 
 	/* LOCK PAGE */
@@ -125,14 +123,14 @@ static struct pginfo* update_base_page(struct vm_area_struct *vma,
 	}
 
 	if (!pg_bin_id  || !pg_last_cooled_ts || pg_bin_index == -ERR_BWTIER_INVAL_BININDEX ||
-			((jiffies - pg_last_cooled_ts) > (cool_period_jiff * NUM_BWTIER_BINS))) {
+			((timestamp - pg_last_cooled_ts) > (cool_period_ns * NUM_BWTIER_BINS))) {
 		/* Page Sampled for the first time */
 		page->access_count = 0;
-		page->last_cooled_timestamp = jiffies;
+		page->last_cooled_timestamp = timestamp;
 	} else {
-		while ((jiffies - pg_last_cooled_ts) > cool_period_jiff) {
+		while ((timestamp - pg_last_cooled_ts) > cool_period_ns) {
 			page->access_count /= 2;
-			pg_last_cooled_ts += cool_period_jiff;
+			pg_last_cooled_ts += cool_period_ns;
 		}
 		page->last_cooled_timestamp = pg_last_cooled_ts;
 	}
@@ -162,13 +160,13 @@ static struct pginfo* update_base_page(struct vm_area_struct *vma,
 }
 
 static struct pginfo* update_huge_page(struct vm_area_struct *vma,
-		pmd_t *pmd, struct page *page, uint64_t address)
+		pmd_t *pmd, struct page *page, uint64_t address, uint64_t timestamp)
 {
 	return NULL;
 }
 
 static struct pginfo* __update_pte_pginfo(struct vm_area_struct *vma, 
-		pmd_t *pmd, uint64_t address)
+		pmd_t *pmd, uint64_t address, uint64_t timestamp)
 {
 	pte_t *pte, ptent;
 	spinlock_t *ptl;
@@ -187,7 +185,7 @@ static struct pginfo* __update_pte_pginfo(struct vm_area_struct *vma,
 	if (page != compound_head(page))
 		goto pte_unlock;
 
-	pginfo = update_base_page(vma, page);
+	pginfo = update_base_page(vma, page, timestamp);
 
 pte_unlock:
 	pte_unmap_unlock(pte, ptl);
@@ -195,7 +193,7 @@ pte_unlock:
 }
 
 static struct pginfo* __update_pmd_pginfo(struct vm_area_struct *vma, 
-		pud_t *pud, uint64_t address)
+		pud_t *pud, uint64_t address, uint64_t timestamp)
 {
 	pmd_t *pmd, pmdval;
 	struct page *page;
@@ -225,10 +223,10 @@ static struct pginfo* __update_pmd_pginfo(struct vm_area_struct *vma,
 		if (!PageCompound(page))
 			goto out;
 
-		return update_huge_page(vma, pmd, page, address);
+		return update_huge_page(vma, pmd, page, address, timestamp);
 	} else {
 		/* base page */
-		return __update_pte_pginfo(vma, pmd, address);
+		return __update_pte_pginfo(vma, pmd, address, timestamp);
 	}
 
 out:
@@ -236,7 +234,7 @@ out:
 }
 
 static struct pginfo* __update_pginfo(struct vm_area_struct *vma, 
-		uint64_t addr)
+		uint64_t addr, uint64_t timestamp)
 {
 	pgd_t *pgd;
 	p4d_t *p4d;
@@ -254,11 +252,13 @@ static struct pginfo* __update_pginfo(struct vm_area_struct *vma,
 	if (pud_none_or_clear_bad(pud))
 		return NULL;
 
-	return __update_pmd_pginfo(vma, pud, addr);
+	return __update_pmd_pginfo(vma, pud, addr, timestamp);
 }
 
-struct pginfo* update_pginfo(pid_t pid, uint64_t address)
+struct pginfo* update_pginfo(struct bwtier_sample *sample)
 {
+	pid_t pid = sample->pid;
+	uint64_t address = sample->addr, timestamp = sample->time;
 	struct pid *pid_struct = find_get_pid(pid);
 	struct task_struct *p = pid_struct ? 
 			pid_task(pid_struct, PIDTYPE_PID) : NULL;
@@ -284,7 +284,7 @@ struct pginfo* update_pginfo(pid_t pid, uint64_t address)
 			goto mmap_unlock;
 	}
 
-	pginfo = __update_pginfo(vma, address);
+	pginfo = __update_pginfo(vma, address, timestamp);
 
 mmap_unlock:
 	mmap_read_unlock(mm);
