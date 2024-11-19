@@ -38,8 +38,8 @@ struct bwtier_sample {
 	struct perf_event_header header; // 8 bytes
 	uint64_t ip;
 	uint32_t pid, tid;
-	uint64_t time;
-	uint64_t addr;
+	uint64_t timestamp;
+	uint64_t address;
 	uint32_t cpu, res;
 	uint64_t period;
 	uint64_t phys_addr;
@@ -52,29 +52,37 @@ struct sys_stat_record {
 	uint64_t nr_cxl_store_samples;
 	uint64_t ctr_loads;
 	uint64_t ctr_stores;
+	uint64_t time_start;
+	uint64_t time_dur_ns;
 };
 
 struct access_hist_bin {
 	int bin_id; // unique ID, starts with 1
 	uint32_t nr_pages;
 	struct list_head pages_head;
+	struct mutex lock;
 };
 
-/* Information about sampled page to be returned to ksampld
- * for updating various counters and statistics.
- */
-struct pginfo {
-	uint32_t bin_id;
-	uint32_t nid;
-};
+extern struct cpumask cpu_bitmap;
+extern atomic_t stats_ms, migr_ms;
+extern atomic_t current_record_index[BWTIER_NR_CPUS + 1];
+extern struct sys_stat_record **per_cpu_logs;
+extern struct perf_event **eventlist;
+extern struct perf_event **counterlist;
+
+void bwtier_msleep(unsigned long msecs);
+void cool_once(void);
 
 bool bwtier_status(void);
 int bwtier_enable(void);
 int bwtier_disable(void);
 int ksampld_enable(void);
 int ksampld_disable(void);
-int bwtier_cool_ms(void);
-int set_bwtier_cool_ms(int ms);
+int kmigrtd_enable(void);
+int kmigrtd_disable(void);
+
+int bwtier_migr_ms(void);
+int set_bwtier_migr_ms(int ms);
 int bwtier_stats_ms(void);
 int set_bwtier_stats_ms(int ms);
 void clear_bwtier_pids(void);
@@ -91,5 +99,7 @@ void bwtier_enable_all_cpus(void);
 void bwtier_disable_all_cpus(void);
 
 void ksampld_init(void);
+void kmigrtd_init(void);
 void bwtier_core_init(void);
-struct pginfo* update_pginfo(struct bwtier_sample *sample);
+int update_pginfo(struct bwtier_sample *sample, bool is_load);
+int bwtier_statistics(char *kbuf, int len);

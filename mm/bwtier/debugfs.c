@@ -336,18 +336,18 @@ out_buf:
 	return ret;
 }
 
-static ssize_t bwtier_debugfs_cool_ms_read(struct file *file,
+static ssize_t bwtier_debugfs_migr_ms_read(struct file *file,
 		char __user *buf, size_t count, loff_t *ppos)
 {
 	char kbuf[8];
 	int len;
 
-	len = scnprintf(kbuf, 8, "%d\n", bwtier_cool_ms());
+	len = scnprintf(kbuf, 8, "%d\n", bwtier_migr_ms());
 
 	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
 }
 
-static ssize_t bwtier_debugfs_cool_ms_write(struct file *file,
+static ssize_t bwtier_debugfs_migr_ms_write(struct file *file,
 		const char __user *buf, size_t count, loff_t *ppos)
 {
 	ssize_t ret, ret2;
@@ -374,10 +374,27 @@ static ssize_t bwtier_debugfs_cool_ms_write(struct file *file,
 		return -EINVAL;
 	}
 
-	set_bwtier_cool_ms(ms);
+	set_bwtier_migr_ms(ms);
 
 	if (!ret)
 		ret = count;
+	kfree(kbuf);
+	return ret;
+}
+
+static ssize_t bwtier_debugfs_showstats_read(struct file *file,
+		char __user *buf, size_t count, loff_t *ppos)
+{
+	char *kbuf;
+	int len, ret;
+
+	kbuf = kzalloc(512 * SYS_RECORDS_HIST_LEN, GFP_KERNEL | __GFP_NOWARN);
+	if (!kbuf)
+		return -ENOMEM;
+
+	len = bwtier_statistics(kbuf, 512 * SYS_RECORDS_HIST_LEN);
+
+	ret = simple_read_from_buffer(buf, count, ppos, kbuf, len);
 	kfree(kbuf);
 	return ret;
 }
@@ -418,10 +435,15 @@ static const struct file_operations bwtier_debugfs_stats_ms_fops = {
 	.write = bwtier_debugfs_stats_ms_write,
 };
 
-static const struct file_operations bwtier_debugfs_cool_ms_fops = {
+static const struct file_operations bwtier_debugfs_migr_ms_fops = {
 	.open = bwtier_debugfs_open,
-	.read = bwtier_debugfs_cool_ms_read,
-	.write = bwtier_debugfs_cool_ms_write,
+	.read = bwtier_debugfs_migr_ms_read,
+	.write = bwtier_debugfs_migr_ms_write,
+};
+
+static const struct file_operations bwtier_debugfs_showstats_fops = {
+	.open = bwtier_debugfs_open,
+	.read = bwtier_debugfs_showstats_read,
 };
 
 static int __init bwtier_debugfs_init(void)
@@ -442,11 +464,14 @@ static int __init bwtier_debugfs_init(void)
 		bwtier_sysfs_root, NULL, &bwtier_debugfs_pid_fops);
 	debugfs_create_file("stats_ms", 0600,
 		bwtier_sysfs_root, NULL, &bwtier_debugfs_stats_ms_fops);
-	debugfs_create_file("cool_ms", 0600,
-		bwtier_sysfs_root, NULL, &bwtier_debugfs_cool_ms_fops);
+	debugfs_create_file("migr_ms", 0600,
+		bwtier_sysfs_root, NULL, &bwtier_debugfs_migr_ms_fops);
+	debugfs_create_file("show_stats", 0600,
+		bwtier_sysfs_root, NULL, &bwtier_debugfs_showstats_fops);
 
 	bwtier_core_init();
 	ksampld_init();
+	kmigrtd_init();
 
 	return 0;
 }

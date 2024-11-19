@@ -14377,7 +14377,7 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 	attr.precise_ip = 1;
 	attr.disabled = 1;
 	attr.freq = 1;
-	attr.clockid = CLOCK_REALTIME;
+	attr.clockid = CLOCK_MONOTONIC;
 
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
   if (event_fd <= 0) {

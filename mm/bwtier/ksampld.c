@@ -14,13 +14,8 @@ struct perf_event **eventlist = NULL;
 struct perf_event **counterlist = NULL;
 struct task_struct *ksampld_task = NULL;
 
-static struct hrtimer htimer;
-static ktime_t kt_periode;
-atomic_t nall, ndram, ncxl, nthrottled, nlost, nzero, nothers;
-
-atomic_t ksampld_status_var;
 atomic_t pages_per_cpuevent;
-atomic_t pebsfreq, stats_ms;
+atomic_t pebsfreq;
 atomic_t ntracked_pids;
 pid_t *tracked_pids = NULL;
 
@@ -49,87 +44,20 @@ static bool pid_is_tracked(pid_t pid)
 	return false;
 }
 
-static enum hrtimer_restart print_stats(struct hrtimer *timer)
-{
-	int event_id, cpu, pos;
-	uint64_t val, enabled, running;
-	int n_dram = atomic_read(&ndram);
-	int n_cxl = atomic_read(&ncxl);
-	int n_throttled = atomic_read(&nthrottled);
-	int n_lost = atomic_read(&nlost);
-	int n_zero = atomic_read(&nzero);
-	int n_others = atomic_read(&nothers);
-	int n_all = atomic_read(&nall);
-
-	printk(KERN_INFO "[KSAMPLD] %d DR:%d CX:%d Thr:%d Lost:%d 0:%d Oth:%d\n",
-			n_all, n_dram, n_cxl, n_throttled, n_lost, n_zero, n_others);
-
-	for (event_id = 0; event_id < NUM_BWTIER_COUNTERS; event_id++) {
-		cpu = -1;
-		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
-			pos = event_id * BWTIER_NR_CPUS + cpu;
-			if (counterlist[pos]) {
-				val = bwtier_perf_counter_read(counterlist[pos], &enabled, &running);
-				printk(KERN_INFO "[KSAMPLD] Counter[%d] CPU[%d] Val:%llu (%llu/%llu)\n",
-						event_id, cpu, val, running, enabled);
-			}
-		}
-	}
-
-	hrtimer_forward_now(timer, kt_periode);
-	return HRTIMER_RESTART;
-}
-
-static void enable_printstats(void)
-{
-	int secs, stats_period_ms = atomic_read(&stats_ms);
-	uint64_t nsecs;
-
-	atomic_set(&ndram, 0);
-	atomic_set(&ncxl, 0);
-	atomic_set(&nthrottled, 0);
-	atomic_set(&nlost, 0);
-	atomic_set(&nzero, 0);
-	atomic_set(&nothers, 0);
-	atomic_set(&nall, 0);
-
-	secs = stats_period_ms / 1000;
-	nsecs = (uint64_t)(stats_period_ms % 1000) * 1000000;
-  kt_periode = ktime_set(secs, nsecs);
-  hrtimer_init (&htimer, CLOCK_REALTIME, HRTIMER_MODE_REL);
-  htimer.function = print_stats;
-  hrtimer_start(&htimer, kt_periode, HRTIMER_MODE_REL);
-
-	printk(KERN_INFO "[KSAMPLD] Printing Stats %d %llu\n", secs, nsecs);
-}
-
-static void disable_printstats(void)
-{
-  hrtimer_cancel(&htimer);
-}
-
-/*
- * TODOs
- * 1. We assume that a sampled entry from PEBS is read immediately
- * 	  by ksampld. Ensure that (data_head - data_tail) <= CONST.
- *    If this gets violated, lower perf period.
- *    Control the CPU overhead of ksampld. For this lower both the
- *    perf period and introduce sleep in the ksampld loop.
- * 2. Develop timer into a statistics accumulation and aggregation unit.
- *    Introduce perf event counters for LLC misses (load and store).
- *    Use the counter values to weight the samples.
- */
 static int ksampld(void *ksampld_args)
 {
 	struct perf_buffer *rb;
 	struct perf_event_mmap_page *metapage;
 	struct perf_event_header *header;
 	struct bwtier_sample *sample;
-	struct pginfo *pginfo;
 	int event_id, pos, pgshift, iterct, cpu;
 	uint64_t data_head, data_tail, pgindex, offset;
+	uint64_t now = ktime_get_ns(), last = now, tdelta_ms;
+	int sample_batchsz = atomic_read(&pebsfreq) * (1000 / KSAMPLD_PERIOD_MS);
 
 	while (!kthread_should_stop()) {
+		now = ktime_get_ns();
+
 		for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
 			cpu = -1;
 			while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
@@ -148,7 +76,7 @@ static int ksampld(void *ksampld_args)
 
 				metapage = READ_ONCE(rb->user_page);
 				data_head = READ_ONCE(metapage->data_head);
-				for (iterct = 0; iterct < SAMPLE_BATCH_SIZE; iterct++) {
+				for (iterct = 0; iterct < sample_batchsz; iterct++) {
 					data_tail = READ_ONCE(metapage->data_tail);
 					if (data_head == data_tail) {
 						break;
@@ -162,39 +90,15 @@ static int ksampld(void *ksampld_args)
 
 					header = (struct perf_event_header *)((char *)
 							(rb->data_pages[pgindex]) + offset);
-					atomic_inc(&nall);
 
 					switch (header->type) {
 						case PERF_RECORD_SAMPLE:
 							sample = (struct bwtier_sample *)header;
 							if (pid_is_tracked(sample->pid)) {
-								pginfo = update_pginfo(sample);
-								if (!pginfo) {
-									atomic_inc(&nzero);
-								} else if (pginfo->nid == 0 || pginfo->nid == 1) {
-									/* DRAM Address */
-									atomic_inc(&ndram);
-								} else if (pginfo->nid == 2 || pginfo->nid == 3) {
-									/* CXL Address */
-									atomic_inc(&ncxl);
-								} else {
-									/* Other Address */
-									atomic_inc(&nothers);
-								}
-							} else {
-								atomic_inc(&nothers);
+								update_pginfo(sample, !(event_id % 2));
 							}
 							break;
-
-						case PERF_RECORD_THROTTLE:
-						case PERF_RECORD_UNTHROTTLE:
-							atomic_inc(&nthrottled);
-							break;
-						case PERF_RECORD_LOST:
-							atomic_inc(&nlost);
-							break;
 						default:
-							atomic_inc(&nothers);
 							break;
 					}
 
@@ -204,6 +108,11 @@ static int ksampld(void *ksampld_args)
 				}
 			}
 		}
+
+		last = now;
+		now = ktime_get_ns();
+		tdelta_ms = (now - last) / NSEC_PER_MSEC;
+		bwtier_msleep(KSAMPLD_PERIOD_MS - tdelta_ms);
 	}
 
 	return 0;
@@ -215,8 +124,8 @@ static int ksampld_start(void)
 	int perfpages = atomic_read(&pages_per_cpuevent);
 	int freq = atomic_read(&pebsfreq);
 
-	if (ksampld_task)
-		return 0;
+	if (ksampld_task != NULL)
+		return -EBUSY;
 
 	if (!eventlist) {
 		eventlist = vzalloc(sizeof(struct perf_event *) *
@@ -272,7 +181,6 @@ static int ksampld_start(void)
 	}
 
 	msleep(100);
-	enable_printstats();
 	ksampld_task = kthread_run(ksampld, NULL, "ksampld");
 	return 0;
 }
@@ -285,9 +193,7 @@ static int ksampld_stop(void)
 		return 0;
 	}
 
-	disable_printstats();
 	kthread_stop(ksampld_task);
-	msleep(100);
 	ksampld_task = NULL;
 
 	for (event_id = 0; event_id < NUM_BWTIER_EVENTS; event_id++) {
@@ -316,19 +222,12 @@ void ksampld_init(void)
 	int perfpages = MAX_PAGES_PER_CPUEVENT / 4;
 	int freq = 1000;
 
-	atomic_set(&ksampld_status_var, 0);
 	atomic_set(&pages_per_cpuevent, perfpages);
 	atomic_set(&pebsfreq, freq);
-	atomic_set(&stats_ms, 100);
 	atomic_set(&ntracked_pids, 0);
 
 	bwtier_enable_all_cpus();
-	tracked_pids = kzalloc(sizeof(pid_t) * MAX_PIDS, GFP_KERNEL);
-}
-
-bool bwtier_status(void)
-{
-	return atomic_read(&ksampld_status_var);
+	tracked_pids = kzalloc(sizeof(pid_t) * MAX_PIDS, GFP_KERNEL | __GFP_NOWARN);
 }
 
 int ksampld_enable(void)
@@ -336,8 +235,6 @@ int ksampld_enable(void)
 	if (ksampld_task == NULL) {
 		ksampld_start();
 	}
-		
-	atomic_set(&ksampld_status_var, 1);
 
 	return 0;
 }
@@ -348,29 +245,7 @@ int ksampld_disable(void)
 		ksampld_stop();
 	}
 
-	atomic_set(&ksampld_status_var, 0);
-
 	return 0;
-}
-
-void bwtier_set_cpu_bitmap(struct cpumask *mask)
-{
-	cpumask_copy(&cpu_bitmap, mask);
-}
-
-void bwtier_get_cpu_bitmap(struct cpumask *mask)
-{
-	cpumask_copy(mask, &cpu_bitmap);
-}
-
-void bwtier_enable_all_cpus(void)
-{
-	cpumask_setall(&cpu_bitmap);
-}
-
-void bwtier_disable_all_cpus(void)
-{
-	cpumask_clear(&cpu_bitmap);
 }
 
 int bwtier_get_pages_per_cpuevent(void)
@@ -442,20 +317,4 @@ void bwtier_set_pid(pid_t pid)
 
 	tracked_pids[npids] = pid;
 	atomic_inc(&ntracked_pids);
-}
-
-int bwtier_stats_ms(void)
-{
-	return atomic_read(&stats_ms);
-}
-
-int set_bwtier_stats_ms(int ms)
-{
-	int secs, nsecs;
-
-	atomic_set(&stats_ms, ms);
-	secs = ms / 1000;
-	nsecs = (ms % 1000) * 1000000;
-  kt_periode = ktime_set(secs, nsecs);
-	return 0;
 }
