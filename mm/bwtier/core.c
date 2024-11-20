@@ -10,7 +10,7 @@
 atomic_t bwtier_status_var;
 
 struct access_hist_bin* pg_hist_bins;
-static atomic_t oldest_bin_index;
+atomic_t oldest_bin_index;
 
 void bwtier_msleep(unsigned long msecs)
 {
@@ -22,7 +22,7 @@ void bwtier_msleep(unsigned long msecs)
 		usleep_idle_range(usecs, usecs + 1);
 }
 
-static int bin_index_from_access_count(int access_count)
+int bin_index_from_access_count(int access_count)
 {
 	int x = ilog2(access_count);
 	int index = atomic_read(&oldest_bin_index);
@@ -33,7 +33,7 @@ static int bin_index_from_access_count(int access_count)
 	return (x + index) % NUM_BWTIER_BINS;
 }
 
-static int bin_index_from_bin_id(int bin_id)
+int bin_index_from_bin_id(int bin_id)
 {
 	int oldest_bin_index_val = atomic_read(&oldest_bin_index);
 	int oldest_bin_id = pg_hist_bins[oldest_bin_index_val].bin_id;
@@ -70,12 +70,17 @@ void cool_once(void)
 
 	mutex_lock(&(pg_hist_bins[oldest_bin_index_val].lock));
 	list_for_each_safe(headnext, headnextnext,
-			&(pg_hist_bins[oldest_bin_index_val].pages_head)) {
+			&(pg_hist_bins[oldest_bin_index_val].dram_pages_head)) {
+		list_del(headnext);
+	}
+	list_for_each_safe(headnext, headnextnext,
+			&(pg_hist_bins[oldest_bin_index_val].cxl_pages_head)) {
 		list_del(headnext);
 	}
 	mutex_unlock(&(pg_hist_bins[oldest_bin_index_val].lock));
 
-	pg_hist_bins[oldest_bin_index_val].nr_pages = 0;
+	pg_hist_bins[oldest_bin_index_val].nr_dram_pages = 0;
+	pg_hist_bins[oldest_bin_index_val].nr_cxl_pages = 0;
 	pg_hist_bins[oldest_bin_index_val].bin_id = new_bin_id;
 	printk(KERN_INFO "Cooled Once %d\n", oldest_bin_index_val);
 }
@@ -90,9 +95,11 @@ void bwtier_core_init(void)
 			NUM_BWTIER_BINS);
 
 	for (i = 0; i < NUM_BWTIER_BINS; i++) {
-		pg_hist_bins[i].nr_pages = 0;
+		pg_hist_bins[i].nr_dram_pages = 0;
+		pg_hist_bins[i].nr_cxl_pages = 0;
 		pg_hist_bins[i].bin_id = i+1;
-		INIT_LIST_HEAD(&(pg_hist_bins[i].pages_head));
+		INIT_LIST_HEAD(&(pg_hist_bins[i].dram_pages_head));
+		INIT_LIST_HEAD(&(pg_hist_bins[i].cxl_pages_head));
 		mutex_init(&(pg_hist_bins[i].lock));
 	}
 }
@@ -136,20 +143,38 @@ static int update_base_page(struct vm_area_struct *vma,
 
 	if (pg_bin_id != bin_id) {
 		if (pg_bin_index != -ERR_BWTIER_INVAL_BININDEX) {
-			pg_hist_bins[pg_bin_index].nr_pages--;
+			if (iscxl)
+				pg_hist_bins[pg_bin_index].nr_cxl_pages--;
+			else
+				pg_hist_bins[pg_bin_index].nr_dram_pages--;
+
 			mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
-			list_move(&(page->bwtier_list),
-				  &(pg_hist_bins[bin_index].pages_head));
+			if (iscxl) {
+				list_move(&(page->bwtier_list),
+					  &(pg_hist_bins[bin_index].cxl_pages_head));
+			} else {
+				list_move(&(page->bwtier_list),
+					  &(pg_hist_bins[bin_index].dram_pages_head));
+			}
 			mutex_unlock(&(pg_hist_bins[bin_index].lock));
 			mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
 		} else {
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
-			list_add(&(page->bwtier_list),
-				  &(pg_hist_bins[bin_index].pages_head));
+			if (iscxl) {
+				list_add(&(page->bwtier_list),
+						&(pg_hist_bins[bin_index].cxl_pages_head));
+			} else {
+				list_add(&(page->bwtier_list),
+						&(pg_hist_bins[bin_index].dram_pages_head));
+			}
 			mutex_unlock(&(pg_hist_bins[bin_index].lock));
 		}
-		pg_hist_bins[bin_index].nr_pages++;
+
+		if (iscxl)
+			pg_hist_bins[bin_index].nr_cxl_pages++;
+		else
+			pg_hist_bins[bin_index].nr_dram_pages++;
 		page->bin_id = bin_id;
 	}
 
@@ -307,7 +332,7 @@ put_task:
 
 int bwtier_statistics(char *kbuf, int buflen)
 {
-	int index, curr_index, len = 0;
+	int index, curr_index, old_index, len = 0;
 
 	if (atomic_read(&bwtier_status_var) == 0)
 		return 0;
@@ -315,26 +340,37 @@ int bwtier_statistics(char *kbuf, int buflen)
 	if (!kbuf)
 		return -EINVAL;
 
-	curr_index =	atomic_read(&current_record_index[BWTIER_NR_CPUS]);
+	old_index =	atomic_read(&oldest_bin_index);
+	index = (old_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	while (index != old_index) {
+		len += scnprintf(kbuf + len, buflen - len, "[%d : (%d/%d)]\t",
+				pg_hist_bins[index].bin_id, pg_hist_bins[index].nr_dram_pages,
+				pg_hist_bins[index].nr_cxl_pages);
+		index = (index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	}
+	len += scnprintf(kbuf + len, buflen - len, "[%d : (%d/%d)]\n",
+			pg_hist_bins[old_index].bin_id, pg_hist_bins[old_index].nr_dram_pages,
+			pg_hist_bins[old_index].nr_cxl_pages);
 
+	curr_index = atomic_read(&current_record_index[BWTIER_NR_CPUS]);
 	index = (curr_index + SYS_RECORDS_HIST_LEN - 1) % SYS_RECORDS_HIST_LEN;
 	while (index != curr_index) {
-		len += scnprintf(kbuf + len, buflen - len, "Record %d (%llu-%llu)\n",
+		len += scnprintf(kbuf + len, buflen - len, "Rec %d (%llu-%llu)\t",
 				index, per_cpu_logs[BWTIER_NR_CPUS][index].time_start,
 				per_cpu_logs[BWTIER_NR_CPUS][index].time_start +
 				per_cpu_logs[BWTIER_NR_CPUS][index].time_dur_ns);
-		len += scnprintf(kbuf + len, buflen - len, "DRAM Load Samples: %llu\n",
+		len += scnprintf(kbuf + len, buflen - len, "DR.Ld: %llu\t",
 				per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_load_samples);
-		len += scnprintf(kbuf + len, buflen - len, "DRAM Store Samples: %llu\n",
+		len += scnprintf(kbuf + len, buflen - len, "DR.St: %llu\t",
 				per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_store_samples);
-		len += scnprintf(kbuf + len, buflen - len, "CXL Load Samples: %llu\n",
+		len += scnprintf(kbuf + len, buflen - len, "CX.Ld: %llu\t",
 				per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_load_samples);
-		len += scnprintf(kbuf + len, buflen - len, "CXL Store Samples: %llu\n",
+		len += scnprintf(kbuf + len, buflen - len, "CX.St: %llu\t",
 				per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_store_samples);
-		len += scnprintf(kbuf + len, buflen - len, "Total Loads: %llu B\n",
-				per_cpu_logs[BWTIER_NR_CPUS][index].ctr_loads * 64);
-		len += scnprintf(kbuf + len, buflen - len, "Total Stores: %llu B\n\n",
-				per_cpu_logs[BWTIER_NR_CPUS][index].ctr_stores * 64);
+		len += scnprintf(kbuf + len, buflen - len, "Loads: %llu MB\t",
+				(per_cpu_logs[BWTIER_NR_CPUS][index].ctr_loads * 64) / (1ULL << 20));
+		len += scnprintf(kbuf + len, buflen - len, "Stores: %llu MB\n",
+				(per_cpu_logs[BWTIER_NR_CPUS][index].ctr_stores * 64) / (1ULL << 20));
 
 		if (len + 512 >= buflen) {
 			break;

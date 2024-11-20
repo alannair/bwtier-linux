@@ -6,12 +6,81 @@
  */
 
 #include <linux/bwtier.h>
+#include <linux/migrate.h>
 
 struct sys_stat_record** per_cpu_logs;
 atomic_t current_record_index[BWTIER_NR_CPUS + 1]; // last is for total
 struct task_struct *kmigrtd_task = NULL;
 
 atomic_t stats_ms, migr_ms;
+atomic_t migr_status_var;
+
+static struct folio *alloc_target_page(struct folio *src, unsigned long node)
+{
+	struct page *page, *newpage;
+	int bin_index;
+	gfp_t gfp_mask = (GFP_HIGHUSER_MOVABLE | __GFP_THISNODE |
+			__GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN) &
+			~__GFP_RECLAIM;
+
+	if (folio_test_hugetlb(src) || folio_test_pmd_mappable(src))
+		return NULL;
+
+	page = folio_page(src, 0);
+	bin_index = bin_index_from_bin_id(page->bin_id);
+
+	newpage = __alloc_pages_node((int)node, gfp_mask, 0);
+
+	list_del(&page->bwtier_list);
+	if (node == 2 || node == 3) {
+		// migrating DRAM -> CXL
+		list_move(&(newpage->bwtier_list),
+			  &(pg_hist_bins[bin_index].cxl_pages_head));
+	} else {
+		// migrating CXL -> DRAM
+		list_move(&(newpage->bwtier_list),
+			  &(pg_hist_bins[bin_index].dram_pages_head));
+	}
+
+	newpage->bin_id = page->bin_id;
+	newpage->access_count = page->access_count;
+	newpage->last_cooled_timestamp = page->last_cooled_timestamp;
+
+	page->bin_id = 0;
+	page->access_count = 0;
+	page->last_cooled_timestamp = 0;
+
+	return page_folio(newpage);
+}
+
+static int bw_balance(void)
+{
+	int old_index = atomic_read(&oldest_bin_index);
+	int new_index = (old_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	int max_migr_bins = NUM_BWTIER_BINS / 2;
+	int nr_bins_migrated = 0, nr_pages_migrated = 0, nrsuccess = 0;
+	unsigned long targetnid = 2;
+
+	while (new_index != old_index && nr_bins_migrated < max_migr_bins) {
+		mutex_lock(&(pg_hist_bins[new_index].lock));
+		migrate_pages(&(pg_hist_bins[new_index].dram_pages_head),
+				alloc_target_page, NULL, targetnid, MIGRATE_ASYNC,
+				MR_BWTIER, &nrsuccess);
+		mutex_unlock(&(pg_hist_bins[new_index].lock));
+
+		pg_hist_bins[new_index].nr_dram_pages -= nrsuccess;
+		pg_hist_bins[new_index].nr_cxl_pages += nrsuccess;
+
+		targetnid = (targetnid == 2) ? 3 : 2;
+		++nr_bins_migrated;
+		nr_pages_migrated += nrsuccess;
+		new_index = (new_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	}
+
+	printk(KERN_INFO "Migrated %d pages\n", nr_pages_migrated);
+
+	return nr_pages_migrated;
+}
 
 static int kmigrtd(void *kmigrtd_args)
 {
@@ -28,7 +97,8 @@ static int kmigrtd(void *kmigrtd_args)
 
 		if (ms_since_migr >= migr_period_ms) {
 			ms_since_migr -= migr_period_ms;
-			//migrate_pages_from_hottest_bins
+			if (migr_status())
+				bw_balance();
 			cool_once();
 		}
 
@@ -141,6 +211,7 @@ void kmigrtd_init(void)
 {
 	atomic_set(&stats_ms, 100);
 	atomic_set(&migr_ms, COOLING_PERIOD_MS);
+	atomic_set(&migr_status_var, 0);
 }
 
 int kmigrtd_enable(void)
@@ -181,4 +252,21 @@ int set_bwtier_migr_ms(int ms)
 {
 	atomic_set(&migr_ms, ms);
 	return 0;
+}
+
+int migr_enable(void)
+{
+	atomic_set(&migr_status_var, 1);
+	return 0;
+}
+
+int migr_disable(void)
+{
+	atomic_set(&migr_status_var, 0);
+	return 0;
+}
+
+bool migr_status(void)
+{
+	return atomic_read(&migr_status_var);
 }

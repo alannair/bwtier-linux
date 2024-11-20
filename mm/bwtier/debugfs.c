@@ -67,6 +67,57 @@ static ssize_t bwtier_debugfs_status_write(struct file *file,
 	return ret;
 }
 
+static ssize_t bwtier_debugfs_migrstatus_read(struct file *file,
+		char __user *buf, size_t count, loff_t *ppos)
+{
+	char kbuf[5];
+	int len;
+
+	len = scnprintf(kbuf, 5, migr_status() ? "on\n" : "off\n");
+
+	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+static ssize_t bwtier_debugfs_migrstatus_write(struct file *file,
+		const char __user *buf, size_t count, loff_t *ppos)
+{
+	ssize_t ret, ret2;
+	char *kbuf;
+
+	if (*ppos)
+		return -EINVAL;
+
+	kbuf = kmalloc(count + 1, GFP_KERNEL | __GFP_NOWARN);
+	if (!kbuf)
+		return -ENOMEM;
+
+	ret2 = simple_write_to_buffer(kbuf, count + 1, ppos, buf, count);
+	if (ret2 != count) {
+		kfree(kbuf);
+		return -EIO;
+	}
+	kbuf[ret2] = '\0';
+
+	/* Remove white space */
+	if (sscanf(kbuf, "%s", kbuf) != 1) {
+		kfree(kbuf);
+		return -EINVAL;
+	}
+
+	if (!strncmp(kbuf, "on", count)) {
+		ret = migr_enable();
+	} else if (!strncmp(kbuf, "off", count)) {
+		ret = migr_disable();
+	} else {
+		ret = -EINVAL;
+	}
+
+	if (!ret)
+		ret = count;
+	kfree(kbuf);
+	return ret;
+}
+
 static ssize_t bwtier_debugfs_cpus_read(struct file *file,
 		char __user *buf, size_t count, loff_t *ppos)
 {
@@ -405,6 +456,12 @@ static const struct file_operations bwtier_debugfs_status_fops = {
 	.write = bwtier_debugfs_status_write,
 };
 
+static const struct file_operations bwtier_debugfs_migrstatus_fops = {
+	.open = bwtier_debugfs_open,
+	.read = bwtier_debugfs_migrstatus_read,
+	.write = bwtier_debugfs_migrstatus_write,
+};
+
 static const struct file_operations bwtier_debugfs_cpus_fops = {
 	.open = bwtier_debugfs_open,
 	.read = bwtier_debugfs_cpus_read,
@@ -454,6 +511,8 @@ static int __init bwtier_debugfs_init(void)
 
 	debugfs_create_file("status", 0600, bwtier_sysfs_root, 
 		NULL, &bwtier_debugfs_status_fops);
+	debugfs_create_file("migr_status", 0600, bwtier_sysfs_root,
+		NULL, &bwtier_debugfs_migrstatus_fops);
 	debugfs_create_file("cpus", 0600, bwtier_sysfs_root, 
 		NULL, &bwtier_debugfs_cpus_fops);
 	debugfs_create_file("pages_per_cpuevent", 0600,

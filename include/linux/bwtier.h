@@ -58,11 +58,15 @@ struct sys_stat_record {
 
 struct access_hist_bin {
 	int bin_id; // unique ID, starts with 1
-	uint32_t nr_pages;
-	struct list_head pages_head;
+	uint32_t nr_dram_pages;
+	uint32_t nr_cxl_pages;
+	struct list_head dram_pages_head;
+	struct list_head cxl_pages_head;
 	struct mutex lock;
 };
 
+extern struct access_hist_bin *pg_hist_bins;
+extern atomic_t oldest_bin_index;
 extern struct cpumask cpu_bitmap;
 extern atomic_t stats_ms, migr_ms;
 extern atomic_t current_record_index[BWTIER_NR_CPUS + 1];
@@ -74,8 +78,11 @@ void bwtier_msleep(unsigned long msecs);
 void cool_once(void);
 
 bool bwtier_status(void);
+bool migr_status(void);
 int bwtier_enable(void);
 int bwtier_disable(void);
+int migr_enable(void);
+int migr_disable(void);
 int ksampld_enable(void);
 int ksampld_disable(void);
 int kmigrtd_enable(void);
@@ -97,6 +104,9 @@ void bwtier_set_cpu_bitmap(struct cpumask *mask);
 void bwtier_get_cpu_bitmap(struct cpumask *mask);
 void bwtier_enable_all_cpus(void);
 void bwtier_disable_all_cpus(void);
+
+int bin_index_from_bin_id(int bin_id);
+int bin_index_from_access_count(int access_count);
 
 void ksampld_init(void);
 void kmigrtd_init(void);
