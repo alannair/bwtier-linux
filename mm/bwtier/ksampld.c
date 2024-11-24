@@ -50,10 +50,13 @@ static int ksampld(void *ksampld_args)
 	struct perf_event_mmap_page *metapage;
 	struct perf_event_header *header;
 	struct bwtier_sample *sample;
-	int event_id, pos, pgshift, iterct, cpu;
+	int event_id, pos, pgshift, iterct, cpu, sample_batchsz;
 	uint64_t data_head, data_tail, pgindex, offset;
 	uint64_t now = ktime_get_ns(), last = now, tdelta_ms;
-	int sample_batchsz = atomic_read(&pebsfreq) * (1000 / KSAMPLD_PERIOD_MS);
+
+	sample_batchsz = (4 * atomic_read(&pebsfreq) * KSAMPLD_PERIOD_MS) / (3 * 1000);
+	if (sample_batchsz < 100)
+		sample_batchsz = 100;
 
 	while (!kthread_should_stop()) {
 		now = ktime_get_ns();
@@ -220,7 +223,7 @@ static int ksampld_stop(void)
 void ksampld_init(void)
 {
 	int perfpages = MAX_PAGES_PER_CPUEVENT / 4;
-	int freq = 1000;
+	int freq = 10000;
 
 	atomic_set(&pages_per_cpuevent, perfpages);
 	atomic_set(&pebsfreq, freq);

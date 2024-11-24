@@ -13,7 +13,7 @@ atomic_t current_record_index[BWTIER_NR_CPUS + 1]; // last is for total
 struct task_struct *kmigrtd_task = NULL;
 
 atomic_t stats_ms, migr_ms;
-atomic_t migr_status_var;
+atomic_t max_migr_pages_per_round;
 
 static struct folio *alloc_target_page(struct folio *src, unsigned long node)
 {
@@ -27,20 +27,21 @@ static struct folio *alloc_target_page(struct folio *src, unsigned long node)
 		return NULL;
 
 	page = folio_page(src, 0);
+	newpage = __alloc_pages_node((int)node, gfp_mask, 0);
 	bin_index = bin_index_from_bin_id(page->bin_id);
 
-	newpage = __alloc_pages_node((int)node, gfp_mask, 0);
-
+	mutex_lock(&(pg_hist_bins[bin_index].lock));
 	list_del(&page->bwtier_list);
 	if (node == 2 || node == 3) {
 		// migrating DRAM -> CXL
-		list_move(&(newpage->bwtier_list),
+		list_add(&(newpage->bwtier_list),
 			  &(pg_hist_bins[bin_index].cxl_pages_head));
 	} else {
 		// migrating CXL -> DRAM
-		list_move(&(newpage->bwtier_list),
+		list_add(&(newpage->bwtier_list),
 			  &(pg_hist_bins[bin_index].dram_pages_head));
 	}
+	mutex_unlock(&(pg_hist_bins[bin_index].lock));
 
 	newpage->bin_id = page->bin_id;
 	newpage->access_count = page->access_count;
@@ -55,24 +56,24 @@ static struct folio *alloc_target_page(struct folio *src, unsigned long node)
 
 static int bw_balance(void)
 {
+	int max_migr_pages = atomic_read(&max_migr_pages_per_round);
 	int old_index = atomic_read(&oldest_bin_index);
-	int new_index = (old_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
-	int max_migr_bins = NUM_BWTIER_BINS / 2;
-	int nr_bins_migrated = 0, nr_pages_migrated = 0, nrsuccess = 0;
+	int new_index = atomic_read(&newest_bin_index);
+	int nr_pages_migrated = 0, nrsuccess = 0;
 	unsigned long targetnid = 2;
 
-	while (new_index != old_index && nr_bins_migrated < max_migr_bins) {
-		mutex_lock(&(pg_hist_bins[new_index].lock));
+	while (new_index != old_index && 
+			nr_pages_migrated < max_migr_pages) {
+		// mutex_lock(&(pg_hist_bins[new_index].lock));
 		migrate_pages(&(pg_hist_bins[new_index].dram_pages_head),
 				alloc_target_page, NULL, targetnid, MIGRATE_ASYNC,
 				MR_BWTIER, &nrsuccess);
-		mutex_unlock(&(pg_hist_bins[new_index].lock));
+		// mutex_unlock(&(pg_hist_bins[new_index].lock));
 
 		pg_hist_bins[new_index].nr_dram_pages -= nrsuccess;
 		pg_hist_bins[new_index].nr_cxl_pages += nrsuccess;
 
 		targetnid = (targetnid == 2) ? 3 : 2;
-		++nr_bins_migrated;
 		nr_pages_migrated += nrsuccess;
 		new_index = (new_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
 	}
@@ -97,14 +98,13 @@ static int kmigrtd(void *kmigrtd_args)
 
 		if (ms_since_migr >= migr_period_ms) {
 			ms_since_migr -= migr_period_ms;
-			if (migr_status())
+			if (max_migr_pages() > 0)
 				bw_balance();
 			cool_once();
 		}
 
 		cpu = -1;
-		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) <
-		       BWTIER_NR_CPUS) {
+		while ((cpu = cpumask_next(cpu, &cpu_bitmap)) < BWTIER_NR_CPUS) {
 			index = atomic_read(&current_record_index[cpu]);
 
 			start = per_cpu_logs[cpu][index].time_start;
@@ -123,11 +123,7 @@ static int kmigrtd(void *kmigrtd_args)
 			ndram_st += per_cpu_logs[cpu][index].nr_dram_store_samples;
 			ncxl_st += per_cpu_logs[cpu][index].nr_cxl_store_samples;
 
-			if (index == SYS_RECORDS_HIST_LEN - 1)
-				index = 0;
-			else
-				index++;
-
+			index = (index + 1) % SYS_RECORDS_HIST_LEN;
 			memset(&per_cpu_logs[cpu][index], 0, sizeof(struct sys_stat_record));
 			atomic_set(&current_record_index[cpu], index);
 			per_cpu_logs[cpu][index].time_start = now;
@@ -135,7 +131,8 @@ static int kmigrtd(void *kmigrtd_args)
 
 		// totals
 		index = atomic_read(&current_record_index[BWTIER_NR_CPUS]);
-		per_cpu_logs[BWTIER_NR_CPUS][index].time_start = now;
+		start = per_cpu_logs[BWTIER_NR_CPUS][index].time_start;
+		per_cpu_logs[BWTIER_NR_CPUS][index].time_dur_ns = now - start;
 		per_cpu_logs[BWTIER_NR_CPUS][index].ctr_loads = sumloads;
 		per_cpu_logs[BWTIER_NR_CPUS][index].ctr_stores = sumstores;
 		per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_load_samples = ndram_ld;
@@ -143,11 +140,7 @@ static int kmigrtd(void *kmigrtd_args)
 		per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_store_samples = ndram_st;
 		per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_store_samples = ncxl_st;
 
-		if (index == SYS_RECORDS_HIST_LEN - 1)
-			index = 0;
-		else
-			index++;
-
+		index = (index + 1) % SYS_RECORDS_HIST_LEN;
 		memset(&per_cpu_logs[BWTIER_NR_CPUS][index], 0, sizeof(struct sys_stat_record));
 		atomic_set(&current_record_index[BWTIER_NR_CPUS], index);
 		per_cpu_logs[BWTIER_NR_CPUS][index].time_start = now;
@@ -156,7 +149,7 @@ static int kmigrtd(void *kmigrtd_args)
 		now = ktime_get_ns();
 		tdelta_ms = (now - last) / NSEC_PER_MSEC;
 		bwtier_msleep(stats_aggr_ms - tdelta_ms);
-		ms_since_migr += (stats_aggr_ms - tdelta_ms);
+		ms_since_migr += stats_aggr_ms;
 	}
 
 	return 0;
@@ -211,7 +204,7 @@ void kmigrtd_init(void)
 {
 	atomic_set(&stats_ms, 100);
 	atomic_set(&migr_ms, COOLING_PERIOD_MS);
-	atomic_set(&migr_status_var, 0);
+	atomic_set(&max_migr_pages_per_round, 0);
 }
 
 int kmigrtd_enable(void)
@@ -254,19 +247,13 @@ int set_bwtier_migr_ms(int ms)
 	return 0;
 }
 
-int migr_enable(void)
+int set_max_migr_pages(int nrpages)
 {
-	atomic_set(&migr_status_var, 1);
+	atomic_set(&max_migr_pages_per_round, nrpages);
 	return 0;
 }
 
-int migr_disable(void)
+int max_migr_pages(void)
 {
-	atomic_set(&migr_status_var, 0);
-	return 0;
-}
-
-bool migr_status(void)
-{
-	return atomic_read(&migr_status_var);
+	return atomic_read(&max_migr_pages_per_round);
 }

@@ -11,6 +11,28 @@ atomic_t bwtier_status_var;
 
 struct access_hist_bin* pg_hist_bins;
 atomic_t oldest_bin_index;
+atomic_t newest_bin_index;
+
+static void check_list_corruption(struct list_head *entry, const char *tag)
+{
+	struct list_head *prev, *next;
+
+	prev = entry->prev;
+	next = entry->next;
+
+	if (next == NULL || prev == NULL || next == LIST_POISON1 || prev == LIST_POISON2) {
+		printk(KERN_ERR "LIST_CORRUPT: %s e:%llx ep:%llx en:%llx\n", 
+				tag, (unsigned long long)entry, (unsigned long long)prev,
+				(unsigned long long)next);
+	} else if (prev->next != entry || next->prev != entry) {
+		printk(KERN_ERR "LIST_CORRUPT: %s e:%llx ep:%llx en:%llx "
+				"epp:%llx epn:%llx enp:%llx enn:%llx\n",
+				tag, (unsigned long long)entry, (unsigned long long)prev,
+				(unsigned long long)next, (unsigned long long)prev->prev,
+				(unsigned long long)prev->next, (unsigned long long)next->prev,
+				(unsigned long long)next->next);
+	}
+}
 
 void bwtier_msleep(unsigned long msecs)
 {
@@ -24,33 +46,40 @@ void bwtier_msleep(unsigned long msecs)
 
 int bin_index_from_access_count(int access_count)
 {
+	int oindex = atomic_read(&oldest_bin_index);
+	int nindex = atomic_read(&newest_bin_index);
 	int x = ilog2(access_count);
-	int index = atomic_read(&oldest_bin_index);
+	int n = (nindex - oindex + NUM_BWTIER_BINS) % NUM_BWTIER_BINS;
 
-	if (x >= NUM_BWTIER_BINS)
-		x = NUM_BWTIER_BINS - 1;
+	if (x >= n)
+		x = n;
 
-	return (x + index) % NUM_BWTIER_BINS;
+	return (x + oindex) % NUM_BWTIER_BINS;
 }
 
 int bin_index_from_bin_id(int bin_id)
 {
-	int oldest_bin_index_val = atomic_read(&oldest_bin_index);
-	int oldest_bin_id = pg_hist_bins[oldest_bin_index_val].bin_id;
-	int diff = bin_id - oldest_bin_id;
-	int index = (diff + oldest_bin_index_val) % NUM_BWTIER_BINS;
+	int index, oldest_bin_id, newest_bin_id;
+	int oldest_bin_index_val, newest_bin_index_val;
 
-	if (diff < 0)
+	oldest_bin_index_val = atomic_read(&oldest_bin_index);
+	newest_bin_index_val = atomic_read(&newest_bin_index);
+	oldest_bin_id = pg_hist_bins[oldest_bin_index_val].bin_id;
+	newest_bin_id = pg_hist_bins[newest_bin_index_val].bin_id;
+
+	if ((bin_id < oldest_bin_id))
 		return -ERR_BWTIER_INVAL_BININDEX;
 
-	if (diff > NUM_BWTIER_BINS) {
-		printk(KERN_ERR "Unrecoverable Error diff=%d (%d-%d)\n",
-				diff, bin_id, oldest_bin_id);
+	if (bin_id > newest_bin_id) {
+		printk(KERN_ERR "Unrecoverable Error (?) %d %d %d\n",
+				bin_id, newest_bin_id, oldest_bin_id);
 		return -ERR_INCOMPREHENSIBLE;
 	}
 
+	index = (oldest_bin_index_val + (bin_id - oldest_bin_id)) % NUM_BWTIER_BINS;
+
 	if (pg_hist_bins[index].bin_id != bin_id) {
-		printk(KERN_ERR "Unrecoverable Error %d %d %d\n",
+		printk(KERN_ERR "Unrecoverable Error (??) %d %d %d\n",
 				index, pg_hist_bins[index].bin_id, bin_id);
 		return -ERR_INCOMPREHENSIBLE;
 	}
@@ -60,29 +89,42 @@ int bin_index_from_bin_id(int bin_id)
 
 void cool_once(void)
 {
-	int tmp, oldest_bin_index_val = atomic_read(&oldest_bin_index);
-	int oldest_bin_id = pg_hist_bins[oldest_bin_index_val].bin_id;
-	int new_bin_id = oldest_bin_id + NUM_BWTIER_BINS;
+	int tmp, nextnewindex, oldest_index_val, newest_index_val, new_bin_id;
 	struct list_head *headnext, *headnextnext;
 
-	tmp = (oldest_bin_index_val + 1) % NUM_BWTIER_BINS;
-	atomic_set(&oldest_bin_index, tmp);
+	oldest_index_val = atomic_read(&oldest_bin_index);
+	newest_index_val = atomic_read(&newest_bin_index);
+	new_bin_id = pg_hist_bins[newest_index_val].bin_id + 1;
+	nextnewindex = (newest_index_val + 1) % NUM_BWTIER_BINS;
 
-	mutex_lock(&(pg_hist_bins[oldest_bin_index_val].lock));
-	list_for_each_safe(headnext, headnextnext,
-			&(pg_hist_bins[oldest_bin_index_val].dram_pages_head)) {
-		list_del(headnext);
-	}
-	list_for_each_safe(headnext, headnextnext,
-			&(pg_hist_bins[oldest_bin_index_val].cxl_pages_head)) {
-		list_del(headnext);
-	}
-	mutex_unlock(&(pg_hist_bins[oldest_bin_index_val].lock));
+	if (nextnewindex == oldest_index_val) {
+		// Delete oldest bin
+		tmp = (oldest_index_val + 1) % NUM_BWTIER_BINS;
+		atomic_set(&oldest_bin_index, tmp);
 
-	pg_hist_bins[oldest_bin_index_val].nr_dram_pages = 0;
-	pg_hist_bins[oldest_bin_index_val].nr_cxl_pages = 0;
-	pg_hist_bins[oldest_bin_index_val].bin_id = new_bin_id;
-	printk(KERN_INFO "Cooled Once %d\n", oldest_bin_index_val);
+		mutex_lock(&(pg_hist_bins[oldest_index_val].lock));
+		list_for_each_safe(headnext, headnextnext,
+				&(pg_hist_bins[oldest_index_val].dram_pages_head)) {
+			// check_list_corruption(headnext, "cooldram1");
+			// check_list_corruption(headnextnext, "cooldram2");
+			list_del(headnext);
+		}
+		list_for_each_safe(headnext, headnextnext,
+				&(pg_hist_bins[oldest_index_val].cxl_pages_head)) {
+			// check_list_corruption(headnext, "coolcxl1");
+			// check_list_corruption(headnextnext, "coolcxl2");
+			list_del(headnext);
+		}
+		mutex_unlock(&(pg_hist_bins[oldest_index_val].lock));
+	}
+
+	pg_hist_bins[nextnewindex].nr_dram_pages = 0;
+	pg_hist_bins[nextnewindex].nr_cxl_pages = 0;
+	pg_hist_bins[nextnewindex].bin_id = new_bin_id;
+	INIT_LIST_HEAD(&(pg_hist_bins[nextnewindex].dram_pages_head));
+	INIT_LIST_HEAD(&(pg_hist_bins[nextnewindex].cxl_pages_head));
+	atomic_set(&newest_bin_index, nextnewindex);
+	printk(KERN_INFO "Cooled Once %d %d\n", nextnewindex, new_bin_id);
 }
 
 void bwtier_core_init(void)
@@ -91,6 +133,7 @@ void bwtier_core_init(void)
 
 	atomic_set(&bwtier_status_var, 0);
 	atomic_set(&oldest_bin_index, 0);
+	atomic_set(&newest_bin_index, 1);
 	pg_hist_bins = vzalloc(sizeof(struct access_hist_bin) *
 			NUM_BWTIER_BINS);
 
@@ -111,7 +154,7 @@ static int update_base_page(struct vm_area_struct *vma,
 	int bin_id, pg_bin_id, bin_index, pg_bin_index, curr_record_index;
 	uint64_t pg_acc_count, pg_last_cooled_ts;
 	uint64_t migr_ns = (uint64_t)atomic_read(&migr_ms) * 1000000;
-	int nid = page_to_nid(page), iscxl = 0;
+	int nid = page_to_nid(page), iscxl = 0, cpu = sample->cpu;
 
 	if (nid == 2 || nid == 3)
 		iscxl = 1;
@@ -150,6 +193,7 @@ static int update_base_page(struct vm_area_struct *vma,
 
 			mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
+			// check_list_corruption(&(page->bwtier_list), "updpg_mv");
 			if (iscxl) {
 				list_move(&(page->bwtier_list),
 					  &(pg_hist_bins[bin_index].cxl_pages_head));
@@ -161,6 +205,7 @@ static int update_base_page(struct vm_area_struct *vma,
 			mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
 		} else {
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
+			// check_list_corruption(&(page->bwtier_list), "updpg_add");
 			if (iscxl) {
 				list_add(&(page->bwtier_list),
 						&(pg_hist_bins[bin_index].cxl_pages_head));
@@ -179,18 +224,18 @@ static int update_base_page(struct vm_area_struct *vma,
 	}
 
 	/* Update System Stats Records */
-	curr_record_index = atomic_read(&current_record_index[sample->cpu]);
+	curr_record_index = atomic_read(&current_record_index[cpu]);
 
 	if (is_load) {
 		if (!iscxl)
-			per_cpu_logs[sample->cpu][curr_record_index].nr_dram_load_samples++;
+			per_cpu_logs[cpu][curr_record_index].nr_dram_load_samples++;
 		else
-			per_cpu_logs[sample->cpu][curr_record_index].nr_cxl_load_samples++;
+			per_cpu_logs[cpu][curr_record_index].nr_cxl_load_samples++;
 	} else {
 		if (!iscxl)
-			per_cpu_logs[sample->cpu][curr_record_index].nr_dram_store_samples++;
+			per_cpu_logs[cpu][curr_record_index].nr_dram_store_samples++;
 		else
-			per_cpu_logs[sample->cpu][curr_record_index].nr_cxl_store_samples++;
+			per_cpu_logs[cpu][curr_record_index].nr_cxl_store_samples++;
 	}
 
 	return 0;
@@ -332,7 +377,9 @@ put_task:
 
 int bwtier_statistics(char *kbuf, int buflen)
 {
-	int index, curr_index, old_index, len = 0;
+	int index, nextindex, curr_index, old_index, len = 0;
+	uint64_t start, dur, end;
+	uint64_t loads, stores,dr_loads, dr_stores, cx_loads, cx_stores;
 
 	if (atomic_read(&bwtier_status_var) == 0)
 		return 0;
@@ -341,7 +388,7 @@ int bwtier_statistics(char *kbuf, int buflen)
 		return -EINVAL;
 
 	old_index =	atomic_read(&oldest_bin_index);
-	index = (old_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	index = atomic_read(&newest_bin_index);
 	while (index != old_index) {
 		len += scnprintf(kbuf + len, buflen - len, "[%d : (%d/%d)]\t",
 				pg_hist_bins[index].bin_id, pg_hist_bins[index].nr_dram_pages,
@@ -354,30 +401,37 @@ int bwtier_statistics(char *kbuf, int buflen)
 
 	curr_index = atomic_read(&current_record_index[BWTIER_NR_CPUS]);
 	index = (curr_index + SYS_RECORDS_HIST_LEN - 1) % SYS_RECORDS_HIST_LEN;
-	while (index != curr_index) {
-		len += scnprintf(kbuf + len, buflen - len, "Rec %d (%llu-%llu)\t",
-				index, per_cpu_logs[BWTIER_NR_CPUS][index].time_start,
-				per_cpu_logs[BWTIER_NR_CPUS][index].time_start +
-				per_cpu_logs[BWTIER_NR_CPUS][index].time_dur_ns);
-		len += scnprintf(kbuf + len, buflen - len, "DR.Ld: %llu\t",
-				per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_load_samples);
-		len += scnprintf(kbuf + len, buflen - len, "DR.St: %llu\t",
-				per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_store_samples);
-		len += scnprintf(kbuf + len, buflen - len, "CX.Ld: %llu\t",
-				per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_load_samples);
-		len += scnprintf(kbuf + len, buflen - len, "CX.St: %llu\t",
-				per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_store_samples);
-		len += scnprintf(kbuf + len, buflen - len, "Loads: %llu MB\t",
-				(per_cpu_logs[BWTIER_NR_CPUS][index].ctr_loads * 64) / (1ULL << 20));
-		len += scnprintf(kbuf + len, buflen - len, "Stores: %llu MB\n",
-				(per_cpu_logs[BWTIER_NR_CPUS][index].ctr_stores * 64) / (1ULL << 20));
+	nextindex = (index + SYS_RECORDS_HIST_LEN - 1) % SYS_RECORDS_HIST_LEN;
+	while (nextindex != curr_index) {
+		start = per_cpu_logs[BWTIER_NR_CPUS][index].time_start;
+		dur = per_cpu_logs[BWTIER_NR_CPUS][index].time_dur_ns;
+		end = start + dur;
+		len += scnprintf(kbuf + len, buflen - len, "Rec %d (%llu-%llu:%llu)\t", 
+				index, start, end, dur);
+
+		loads = per_cpu_logs[BWTIER_NR_CPUS][index].ctr_loads - 
+				per_cpu_logs[BWTIER_NR_CPUS][nextindex].ctr_loads;
+		stores = per_cpu_logs[BWTIER_NR_CPUS][index].ctr_stores -
+				per_cpu_logs[BWTIER_NR_CPUS][nextindex].ctr_stores;
+		len += scnprintf(kbuf + len, buflen - len, "Loads: %llu MB/s\t", 
+				((loads * NSEC_PER_SEC * 64) / (dur * 1ULL << 20)));
+		len += scnprintf(kbuf + len, buflen - len, "Stores: %llu MB/s\t", 
+				((stores  * NSEC_PER_SEC * 64) / (dur * 1ULL << 20)));
+
+		dr_loads = per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_load_samples;
+		dr_stores = per_cpu_logs[BWTIER_NR_CPUS][index].nr_dram_store_samples;
+		cx_loads = per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_load_samples;
+		cx_stores = per_cpu_logs[BWTIER_NR_CPUS][index].nr_cxl_store_samples;
+		len += scnprintf(kbuf + len, buflen - len, "DR.Ld: %llu\t", dr_loads);
+		len += scnprintf(kbuf + len, buflen - len, "DR.St: %llu\t", dr_stores);
+		len += scnprintf(kbuf + len, buflen - len, "CX.Ld: %llu\t", cx_loads);
+		len += scnprintf(kbuf + len, buflen - len, "CX.St: %llu\n",	cx_stores);
 
 		if (len + 512 >= buflen) {
 			break;
 		}
-		index--;
-		if (index < 0)
-			index = SYS_RECORDS_HIST_LEN - 1;
+		index = nextindex;
+		nextindex = (index + SYS_RECORDS_HIST_LEN - 1) % SYS_RECORDS_HIST_LEN;
 	}
 	kbuf[len] = '\0';
 

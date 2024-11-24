@@ -67,6 +67,8 @@ struct access_hist_bin {
 
 extern struct access_hist_bin *pg_hist_bins;
 extern atomic_t oldest_bin_index;
+extern atomic_t newest_bin_index;
+
 extern struct cpumask cpu_bitmap;
 extern atomic_t stats_ms, migr_ms;
 extern atomic_t current_record_index[BWTIER_NR_CPUS + 1];
@@ -78,11 +80,8 @@ void bwtier_msleep(unsigned long msecs);
 void cool_once(void);
 
 bool bwtier_status(void);
-bool migr_status(void);
 int bwtier_enable(void);
 int bwtier_disable(void);
-int migr_enable(void);
-int migr_disable(void);
 int ksampld_enable(void);
 int ksampld_disable(void);
 int kmigrtd_enable(void);
@@ -92,6 +91,9 @@ int bwtier_migr_ms(void);
 int set_bwtier_migr_ms(int ms);
 int bwtier_stats_ms(void);
 int set_bwtier_stats_ms(int ms);
+int max_migr_pages(void);
+int set_max_migr_pages(int nrpages);
+
 void clear_bwtier_pids(void);
 pid_t *get_pid_list(int *npids);
 void bwtier_set_pid(pid_t pid);

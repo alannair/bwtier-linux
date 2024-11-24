@@ -67,18 +67,18 @@ static ssize_t bwtier_debugfs_status_write(struct file *file,
 	return ret;
 }
 
-static ssize_t bwtier_debugfs_migrstatus_read(struct file *file,
+static ssize_t bwtier_debugfs_max_migr_pages_read(struct file *file,
 		char __user *buf, size_t count, loff_t *ppos)
 {
-	char kbuf[5];
-	int len;
+	char kbuf[8];
+	int len, pages;
 
-	len = scnprintf(kbuf, 5, migr_status() ? "on\n" : "off\n");
+	pages = max_migr_pages();
+	len = scnprintf(kbuf, 8, "%d\n", pages);
 
-	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
-}
+	return simple_read_from_buffer(buf, count, ppos, kbuf, len);}
 
-static ssize_t bwtier_debugfs_migrstatus_write(struct file *file,
+static ssize_t bwtier_debugfs_max_migr_pages_write(struct file *file,
 		const char __user *buf, size_t count, loff_t *ppos)
 {
 	ssize_t ret, ret2;
@@ -104,13 +104,7 @@ static ssize_t bwtier_debugfs_migrstatus_write(struct file *file,
 		return -EINVAL;
 	}
 
-	if (!strncmp(kbuf, "on", count)) {
-		ret = migr_enable();
-	} else if (!strncmp(kbuf, "off", count)) {
-		ret = migr_disable();
-	} else {
-		ret = -EINVAL;
-	}
+	ret = set_max_migr_pages(simple_strtoul(kbuf, NULL, 10));
 
 	if (!ret)
 		ret = count;
@@ -456,10 +450,10 @@ static const struct file_operations bwtier_debugfs_status_fops = {
 	.write = bwtier_debugfs_status_write,
 };
 
-static const struct file_operations bwtier_debugfs_migrstatus_fops = {
+static const struct file_operations bwtier_debugfs_max_migr_pages_fops = {
 	.open = bwtier_debugfs_open,
-	.read = bwtier_debugfs_migrstatus_read,
-	.write = bwtier_debugfs_migrstatus_write,
+	.read = bwtier_debugfs_max_migr_pages_read,
+	.write = bwtier_debugfs_max_migr_pages_write,
 };
 
 static const struct file_operations bwtier_debugfs_cpus_fops = {
@@ -511,8 +505,8 @@ static int __init bwtier_debugfs_init(void)
 
 	debugfs_create_file("status", 0600, bwtier_sysfs_root, 
 		NULL, &bwtier_debugfs_status_fops);
-	debugfs_create_file("migr_status", 0600, bwtier_sysfs_root,
-		NULL, &bwtier_debugfs_migrstatus_fops);
+	debugfs_create_file("migr_pages_per_round", 0600, bwtier_sysfs_root,
+		NULL, &bwtier_debugfs_max_migr_pages_fops);
 	debugfs_create_file("cpus", 0600, bwtier_sysfs_root, 
 		NULL, &bwtier_debugfs_cpus_fops);
 	debugfs_create_file("pages_per_cpuevent", 0600,
