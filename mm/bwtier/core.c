@@ -13,25 +13,13 @@ struct access_hist_bin* pg_hist_bins;
 atomic_t oldest_bin_index;
 atomic_t newest_bin_index;
 
-static void check_list_corruption(struct list_head *entry, const char *tag)
+static int is_some_list_entry(struct list_head *entry)
 {
-	struct list_head *prev, *next;
-
-	prev = entry->prev;
-	next = entry->next;
-
-	if (next == NULL || prev == NULL || next == LIST_POISON1 || prev == LIST_POISON2) {
-		printk(KERN_ERR "LIST_CORRUPT: %s e:%llx ep:%llx en:%llx\n", 
-				tag, (unsigned long long)entry, (unsigned long long)prev,
-				(unsigned long long)next);
-	} else if (prev->next != entry || next->prev != entry) {
-		printk(KERN_ERR "LIST_CORRUPT: %s e:%llx ep:%llx en:%llx "
-				"epp:%llx epn:%llx enp:%llx enn:%llx\n",
-				tag, (unsigned long long)entry, (unsigned long long)prev,
-				(unsigned long long)next, (unsigned long long)prev->prev,
-				(unsigned long long)prev->next, (unsigned long long)next->prev,
-				(unsigned long long)next->next);
-	}
+	/* entry assumed to point to a legit list_head */
+	if (entry->next == LIST_POISON1 || entry->prev == LIST_POISON2 ||
+			entry->next == NULL || entry->prev == NULL)
+		return 0;
+	return 1;
 }
 
 void bwtier_msleep(unsigned long msecs)
@@ -90,7 +78,6 @@ int bin_index_from_bin_id(int bin_id)
 void cool_once(void)
 {
 	int tmp, nextnewindex, oldest_index_val, newest_index_val, new_bin_id;
-	struct list_head *headnext, *headnextnext;
 
 	oldest_index_val = atomic_read(&oldest_bin_index);
 	newest_index_val = atomic_read(&newest_bin_index);
@@ -98,24 +85,8 @@ void cool_once(void)
 	nextnewindex = (newest_index_val + 1) % NUM_BWTIER_BINS;
 
 	if (nextnewindex == oldest_index_val) {
-		// Delete oldest bin
 		tmp = (oldest_index_val + 1) % NUM_BWTIER_BINS;
 		atomic_set(&oldest_bin_index, tmp);
-
-		mutex_lock(&(pg_hist_bins[oldest_index_val].lock));
-		list_for_each_safe(headnext, headnextnext,
-				&(pg_hist_bins[oldest_index_val].dram_pages_head)) {
-			// check_list_corruption(headnext, "cooldram1");
-			// check_list_corruption(headnextnext, "cooldram2");
-			list_del(headnext);
-		}
-		list_for_each_safe(headnext, headnextnext,
-				&(pg_hist_bins[oldest_index_val].cxl_pages_head)) {
-			// check_list_corruption(headnext, "coolcxl1");
-			// check_list_corruption(headnextnext, "coolcxl2");
-			list_del(headnext);
-		}
-		mutex_unlock(&(pg_hist_bins[oldest_index_val].lock));
 	}
 
 	pg_hist_bins[nextnewindex].nr_dram_pages = 0;
@@ -191,21 +162,27 @@ static int update_base_page(struct vm_area_struct *vma,
 			else
 				pg_hist_bins[pg_bin_index].nr_dram_pages--;
 
-			mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
-			mutex_lock(&(pg_hist_bins[bin_index].lock));
-			// check_list_corruption(&(page->bwtier_list), "updpg_mv");
-			if (iscxl) {
-				list_move(&(page->bwtier_list),
-					  &(pg_hist_bins[bin_index].cxl_pages_head));
+			if (!is_some_list_entry(&(page->bwtier_list))) {
+				/* There is some mistake in our logic. Skip this sample for now. */
+				printk(KERN_ERR "list_move: Not Part of any list %d %d %d %d %llx %llx\n",
+						page->bin_id, page->access_count, bin_id, bin_index,
+						(unsigned long long)page->bwtier_list.next,
+						(unsigned long long)page->bwtier_list.prev);
 			} else {
-				list_move(&(page->bwtier_list),
-					  &(pg_hist_bins[bin_index].dram_pages_head));
+				mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
+				mutex_lock(&(pg_hist_bins[bin_index].lock));
+				if (iscxl) {
+					list_move(&(page->bwtier_list),
+						  &(pg_hist_bins[bin_index].cxl_pages_head));
+				} else {
+					list_move(&(page->bwtier_list),
+						  &(pg_hist_bins[bin_index].dram_pages_head));
+				}
+				mutex_unlock(&(pg_hist_bins[bin_index].lock));
+				mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
 			}
-			mutex_unlock(&(pg_hist_bins[bin_index].lock));
-			mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
 		} else {
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
-			// check_list_corruption(&(page->bwtier_list), "updpg_add");
 			if (iscxl) {
 				list_add(&(page->bwtier_list),
 						&(pg_hist_bins[bin_index].cxl_pages_head));

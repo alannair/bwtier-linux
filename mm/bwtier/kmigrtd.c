@@ -54,6 +54,11 @@ static struct folio *alloc_target_page(struct folio *src, unsigned long node)
 	return page_folio(newpage);
 }
 
+/*
+ * TODOs
+ * 1. migrate_pages is being passed a struct page list, make it folio
+ * 2. copy the list corruption workaround to alloc_target_page
+ */
 static int bw_balance(void)
 {
 	int max_migr_pages = atomic_read(&max_migr_pages_per_round);
@@ -64,11 +69,9 @@ static int bw_balance(void)
 
 	while (new_index != old_index && 
 			nr_pages_migrated < max_migr_pages) {
-		// mutex_lock(&(pg_hist_bins[new_index].lock));
 		migrate_pages(&(pg_hist_bins[new_index].dram_pages_head),
 				alloc_target_page, NULL, targetnid, MIGRATE_ASYNC,
 				MR_BWTIER, &nrsuccess);
-		// mutex_unlock(&(pg_hist_bins[new_index].lock));
 
 		pg_hist_bins[new_index].nr_dram_pages -= nrsuccess;
 		pg_hist_bins[new_index].nr_cxl_pages += nrsuccess;
