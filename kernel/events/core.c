@@ -14242,7 +14242,6 @@ int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 		event_file = NULL;
 		goto err_context;
 	}
-	printk("OUT\n");
 
 	if (ctx->task == TASK_TOMBSTONE) {
 		err = -ESRCH;
@@ -14253,8 +14252,6 @@ int bwtier_perf_event_open(struct perf_event_attr *attrptr,
 		err = -E2BIG;
 		goto err_locked;
 	}
-
-
 
 	/*
 	 * This is the point on no return; we cannot fail hereafter.
@@ -14381,7 +14378,9 @@ int bwtier_perf_event_init(struct perf_event **event, uint64_t sample_type,
 
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
   if (event_fd <= 0) {
-		printk(KERN_ERR "[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
+		printk(KERN_ERR 
+				"[error htmm__perf_event_open failure] event_fd: %d\n",
+				event_fd);
 		return -1;
 	}
 
@@ -14441,14 +14440,12 @@ int bwtier_perf_counter_init(struct perf_event **event, uint64_t config,
 	attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | \
 			PERF_FORMAT_TOTAL_TIME_RUNNING;
 
-	printk(KERN_ERR "BEFORE %llu\n", cpu);
 	event_fd = bwtier_perf_event_open(&attr, -1, cpu, -1, 0);
 	if (event_fd <= 0) {
 		printk(KERN_ERR 
 				"[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
 		return -1;
 	}
-	printk(KERN_ERR "AFTER\n");
 
 	file = fget(event_fd);
 	if (!file) {

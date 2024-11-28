@@ -7,6 +7,8 @@
 
 #include <linux/bwtier.h>
 
+#include "../internal.h"
+
 atomic_t bwtier_status_var;
 
 struct access_hist_bin* pg_hist_bins;
@@ -20,6 +22,40 @@ static int is_some_list_entry(struct list_head *entry)
 			entry->next == NULL || entry->prev == NULL)
 		return 0;
 	return 1;
+}
+
+static void update_sample_counts(int cpu, bool is_load, bool is_cxl)
+{
+	int curr_record_index = atomic_read(&current_record_index[cpu]);
+
+	if (is_load) {
+		if (!is_cxl)
+			per_cpu_logs[cpu][curr_record_index].nr_dram_load_samples++;
+		else
+			per_cpu_logs[cpu][curr_record_index].nr_cxl_load_samples++;
+	} else {
+		if (!is_cxl)
+			per_cpu_logs[cpu][curr_record_index].nr_dram_store_samples++;
+		else
+			per_cpu_logs[cpu][curr_record_index].nr_cxl_store_samples++;
+	}
+}
+
+struct folio *bwtier_get_folio(struct page *page)
+{
+	struct folio *folio;
+
+	if (!page || PageTail(page))
+		return NULL;
+
+	folio = page_folio(page);
+	if (!folio)
+		return NULL;
+
+	if (!folio_try_get(folio))
+		return NULL;
+
+	return folio;
 }
 
 void bwtier_msleep(unsigned long msecs)
@@ -78,15 +114,34 @@ int bin_index_from_bin_id(int bin_id)
 void cool_once(void)
 {
 	int tmp, nextnewindex, oldest_index_val, newest_index_val, new_bin_id;
+	struct folio *folio;
 
 	oldest_index_val = atomic_read(&oldest_bin_index);
 	newest_index_val = atomic_read(&newest_bin_index);
 	new_bin_id = pg_hist_bins[newest_index_val].bin_id + 1;
 	nextnewindex = (newest_index_val + 1) % NUM_BWTIER_BINS;
 
+	mutex_lock(&(pg_hist_bins[nextnewindex].lock));
+
 	if (nextnewindex == oldest_index_val) {
 		tmp = (oldest_index_val + 1) % NUM_BWTIER_BINS;
 		atomic_set(&oldest_bin_index, tmp);
+
+		while (!list_empty(&(pg_hist_bins[oldest_index_val].dram_pages_head))) {
+			folio = lru_to_folio(&(pg_hist_bins[oldest_index_val].dram_pages_head));
+			list_del(&(folio->lru));
+			if (!folio_try_get(folio))
+				continue;
+			folio_putback_lru(folio);
+		}
+
+		while (!list_empty(&(pg_hist_bins[oldest_index_val].cxl_pages_head))) {
+			folio = lru_to_folio(&(pg_hist_bins[oldest_index_val].cxl_pages_head));
+			list_del(&(folio->lru));
+			if (!folio_try_get(folio))
+				continue;
+			folio_putback_lru(folio);
+		}
 	}
 
 	pg_hist_bins[nextnewindex].nr_dram_pages = 0;
@@ -95,6 +150,9 @@ void cool_once(void)
 	INIT_LIST_HEAD(&(pg_hist_bins[nextnewindex].dram_pages_head));
 	INIT_LIST_HEAD(&(pg_hist_bins[nextnewindex].cxl_pages_head));
 	atomic_set(&newest_bin_index, nextnewindex);
+
+	mutex_unlock(&(pg_hist_bins[nextnewindex].lock));
+
 	printk(KERN_INFO "Cooled Once %d %d\n", nextnewindex, new_bin_id);
 }
 
@@ -119,104 +177,225 @@ void bwtier_core_init(void)
 }
 
 static int update_base_page(struct vm_area_struct *vma, 
-		struct page *page, struct bwtier_sample *sample, bool is_load) 
+		struct page *page, struct bwtier_sample *sample, bool is_load)
 {
-	uint64_t timestamp = sample->timestamp;
-	int bin_id, pg_bin_id, bin_index, pg_bin_index, curr_record_index;
-	uint64_t pg_acc_count, pg_last_cooled_ts;
-	uint64_t migr_ns = (uint64_t)atomic_read(&migr_ms) * 1000000;
-	int nid = page_to_nid(page), iscxl = 0, cpu = sample->cpu;
+	uint64_t timestamp, pg_last_cooled_ts, migr_ns;
+	int pg_bin_id, pg_acc_count, nid, iscxl, pg_bin_index;
+	int bin_id, bin_index, cpu, ret = 0;
+	struct folio *folio = bwtier_get_folio(page);
 
-	if (nid == 2 || nid == 3)
-		iscxl = 1;
+	migr_ns = (uint64_t)atomic_read(&migr_ms) * NSEC_PER_MSEC;
+	timestamp = sample->timestamp;
+	cpu = sample->cpu;
 
-	/* LOCK PAGE */
-	pg_acc_count = page->access_count;
-	pg_last_cooled_ts = page->last_cooled_timestamp;
-	pg_bin_id = page->bin_id;
+	if (!folio) {
+		ret = -ERR_BWTIER_NO_FOLIO;
+		goto put_folio;
+	}
+
+	if (!folio_trylock(folio)) {
+		ret = -ERR_BWTIER_FOLIO_LOCK;
+		goto put_folio;
+	}
+
+	nid = folio_nid(folio);
+	pg_acc_count = atomic_read(&page->access_count);
+	pg_bin_id = atomic_read(&page->bin_id);
 	pg_bin_index = bin_index_from_bin_id(pg_bin_id);
-	/* UNLOCK PAGE */
+	pg_last_cooled_ts = atomic64_read(&page->last_cooled_timestamp);
 
-	if (!pg_bin_id  || !pg_last_cooled_ts || 
+	if (nid == 2 || nid == 3) {
+		iscxl = 1;
+	} else if (nid == 0 || nid == 1) {
+		iscxl = 0;
+	} else {
+		ret = -ERR_BWTIER_INVAL_NID;
+		goto unlock;
+	}
+
+	if (!pg_bin_id || !pg_last_cooled_ts || 
 			pg_bin_index == -ERR_BWTIER_INVAL_BININDEX ||
 			((timestamp - pg_last_cooled_ts) > (migr_ns * NUM_BWTIER_BINS))) {
 		/* Page Sampled for the first time */
-		page->access_count = 0;
-		page->last_cooled_timestamp = timestamp;
+		atomic_set(&page->access_count, 0);
+		atomic64_set(&page->last_cooled_timestamp, timestamp);
 	} else {
 		while ((timestamp - pg_last_cooled_ts) > migr_ns) {
-			page->access_count /= 2;
+			pg_acc_count /= 2;
 			pg_last_cooled_ts += migr_ns;
 		}
-		page->last_cooled_timestamp = pg_last_cooled_ts;
+		atomic_set(&page->access_count, pg_acc_count);
+		atomic64_set(&page->last_cooled_timestamp, pg_last_cooled_ts);
 	}
 
-	page->access_count += 512; // something related to period
-	bin_index = bin_index_from_access_count(page->access_count);
+	/* add scaled(sample->period) instead of 512 */
+	pg_acc_count = atomic_add_return(512, &page->access_count);
+	bin_index = bin_index_from_access_count(pg_acc_count);
 	bin_id = pg_hist_bins[bin_index].bin_id;
 
-	if (pg_bin_id != bin_id) {
-		if (pg_bin_index != -ERR_BWTIER_INVAL_BININDEX) {
-			if (iscxl)
-				pg_hist_bins[pg_bin_index].nr_cxl_pages--;
-			else
-				pg_hist_bins[pg_bin_index].nr_dram_pages--;
+	// printk(KERN_INFO "Bin Index %d %d %d %d %d %d %d %d\n",
+	// 		bin_index, bin_id, pg_acc_count, pg_bin_id, pg_bin_index,
+	// 		pg_hist_bins[bin_index].nr_dram_pages,
+	// 		pg_hist_bins[bin_index].nr_cxl_pages, iscxl);
 
-			if (!is_some_list_entry(&(page->bwtier_list))) {
-				/* There is some mistake in our logic. Skip this sample for now. */
-				printk(KERN_ERR "list_move: Not Part of any list %d %d %d %d %llx %llx\n",
-						page->bin_id, page->access_count, bin_id, bin_index,
-						(unsigned long long)page->bwtier_list.next,
-						(unsigned long long)page->bwtier_list.prev);
-			} else {
-				mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
-				mutex_lock(&(pg_hist_bins[bin_index].lock));
-				if (iscxl) {
-					list_move(&(page->bwtier_list),
-						  &(pg_hist_bins[bin_index].cxl_pages_head));
-				} else {
-					list_move(&(page->bwtier_list),
-						  &(pg_hist_bins[bin_index].dram_pages_head));
-				}
-				mutex_unlock(&(pg_hist_bins[bin_index].lock));
-				mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
+	if (bin_id != pg_bin_id) {
+		if ((!is_some_list_entry(&(folio->lru))) || folio_isolate_lru(folio)) {
+			/* either folio was never part of any list (cold page)
+			 * or folio was on LRU list, now removed by us
+			 */
+			if (pg_bin_index != -ERR_BWTIER_INVAL_BININDEX) {
+				/* ERROR */
+				ret = -ERR_INCOMPREHENSIBLE;
+				goto unlock;
 			}
-		} else {
+
+			// printk(KERN_INFO "Adding\n");
+
+			ret = 1;
 			mutex_lock(&(pg_hist_bins[bin_index].lock));
-			if (iscxl) {
-				list_add(&(page->bwtier_list),
-						&(pg_hist_bins[bin_index].cxl_pages_head));
+			if (!iscxl) {
+				list_add(&(folio->lru), &(pg_hist_bins[bin_index].dram_pages_head));
+				pg_hist_bins[bin_index].nr_dram_pages++;
 			} else {
-				list_add(&(page->bwtier_list),
-						&(pg_hist_bins[bin_index].dram_pages_head));
+				list_add(&(folio->lru), &(pg_hist_bins[bin_index].cxl_pages_head));
+				pg_hist_bins[bin_index].nr_cxl_pages++;
 			}
 			mutex_unlock(&(pg_hist_bins[bin_index].lock));
+		} else {
+			/* folio must be in one of our lists, exp. at pg_bin_index */
+			if (pg_bin_index == -ERR_BWTIER_INVAL_BININDEX) {
+				/* ERROR */
+				ret = -ERR_INCOMPREHENSIBLE;
+				goto unlock;
+			}
+
+			// printk(KERN_INFO "Moving\n");
+
+			ret = 2;
+			mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
+			mutex_lock(&(pg_hist_bins[bin_index].lock));
+			if (!iscxl) {
+				list_move(&(folio->lru), &(pg_hist_bins[bin_index].dram_pages_head));
+				pg_hist_bins[pg_bin_index].nr_dram_pages--;
+				pg_hist_bins[bin_index].nr_dram_pages++;
+			} else {
+				list_move(&(folio->lru), &(pg_hist_bins[bin_index].cxl_pages_head));
+				pg_hist_bins[pg_bin_index].nr_cxl_pages--;
+				pg_hist_bins[bin_index].nr_cxl_pages++;
+			}
+			mutex_unlock(&(pg_hist_bins[bin_index].lock));
+			mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
 		}
-
-		if (iscxl)
-			pg_hist_bins[bin_index].nr_cxl_pages++;
-		else
-			pg_hist_bins[bin_index].nr_dram_pages++;
-		page->bin_id = bin_id;
 	}
 
-	/* Update System Stats Records */
-	curr_record_index = atomic_read(&current_record_index[cpu]);
+	update_sample_counts(cpu, is_load, iscxl);
 
-	if (is_load) {
-		if (!iscxl)
-			per_cpu_logs[cpu][curr_record_index].nr_dram_load_samples++;
-		else
-			per_cpu_logs[cpu][curr_record_index].nr_cxl_load_samples++;
-	} else {
-		if (!iscxl)
-			per_cpu_logs[cpu][curr_record_index].nr_dram_store_samples++;
-		else
-			per_cpu_logs[cpu][curr_record_index].nr_cxl_store_samples++;
-	}
-
-	return 0;
+unlock:
+	folio_unlock(folio);
+put_folio:
+	folio_put(folio);
+	return ret;
 }
+
+// static int update_base_page(struct vm_area_struct *vma, 
+// 		struct page *page, struct bwtier_sample *sample, bool is_load) 
+// {
+// 	uint64_t timestamp = sample->timestamp;
+// 	int bin_id, pg_bin_id, bin_index, pg_bin_index, curr_record_index;
+// 	uint64_t pg_acc_count, pg_last_cooled_ts;
+// 	uint64_t migr_ns = (uint64_t)atomic_read(&migr_ms) * 1000000;
+// 	int nid = page_to_nid(page), iscxl = 0, cpu = sample->cpu;
+
+// 	if (nid == 2 || nid == 3)
+// 		iscxl = 1;
+
+// 	/* LOCK PAGE */
+// 	pg_acc_count = page->access_count;
+// 	pg_last_cooled_ts = page->last_cooled_timestamp;
+// 	pg_bin_id = page->bin_id;
+// 	pg_bin_index = bin_index_from_bin_id(pg_bin_id);
+// 	/* UNLOCK PAGE */
+
+// 	if (!pg_bin_id  || !pg_last_cooled_ts || 
+// 			pg_bin_index == -ERR_BWTIER_INVAL_BININDEX ||
+// 			((timestamp - pg_last_cooled_ts) > (migr_ns * NUM_BWTIER_BINS))) {
+// 		/* Page Sampled for the first time */
+// 		page->access_count = 0;
+// 		page->last_cooled_timestamp = timestamp;
+// 	} else {
+// 		while ((timestamp - pg_last_cooled_ts) > migr_ns) {
+// 			page->access_count /= 2;
+// 			pg_last_cooled_ts += migr_ns;
+// 		}
+// 		page->last_cooled_timestamp = pg_last_cooled_ts;
+// 	}
+
+// 	page->access_count += 512; // something related to period
+// 	bin_index = bin_index_from_access_count(page->access_count);
+// 	bin_id = pg_hist_bins[bin_index].bin_id;
+
+// 	if (pg_bin_id != bin_id) {
+// 		if (pg_bin_index != -ERR_BWTIER_INVAL_BININDEX) {
+// 			if (iscxl)
+// 				pg_hist_bins[pg_bin_index].nr_cxl_pages--;
+// 			else
+// 				pg_hist_bins[pg_bin_index].nr_dram_pages--;
+
+// 			if (!is_some_list_entry(&(page->bwtier_list))) {
+// 				/* There is some mistake in our logic. Skip this sample for now. */
+// 				printk(KERN_ERR "list_move: Not Part of any list %d %d %d %d %llx %llx\n",
+// 						page->bin_id, page->access_count, bin_id, bin_index,
+// 						(unsigned long long)page->bwtier_list.next,
+// 						(unsigned long long)page->bwtier_list.prev);
+// 			} else {
+// 				mutex_lock(&(pg_hist_bins[pg_bin_index].lock));
+// 				mutex_lock(&(pg_hist_bins[bin_index].lock));
+// 				if (iscxl) {
+// 					list_move(&(page->bwtier_list),
+// 						  &(pg_hist_bins[bin_index].cxl_pages_head));
+// 				} else {
+// 					list_move(&(page->bwtier_list),
+// 						  &(pg_hist_bins[bin_index].dram_pages_head));
+// 				}
+// 				mutex_unlock(&(pg_hist_bins[bin_index].lock));
+// 				mutex_unlock(&(pg_hist_bins[pg_bin_index].lock));
+// 			}
+// 		} else {
+// 			mutex_lock(&(pg_hist_bins[bin_index].lock));
+// 			if (iscxl) {
+// 				list_add(&(page->bwtier_list),
+// 						&(pg_hist_bins[bin_index].cxl_pages_head));
+// 			} else {
+// 				list_add(&(page->bwtier_list),
+// 						&(pg_hist_bins[bin_index].dram_pages_head));
+// 			}
+// 			mutex_unlock(&(pg_hist_bins[bin_index].lock));
+// 		}
+
+// 		if (iscxl)
+// 			pg_hist_bins[bin_index].nr_cxl_pages++;
+// 		else
+// 			pg_hist_bins[bin_index].nr_dram_pages++;
+// 		page->bin_id = bin_id;
+// 	}
+
+// 	/* Update System Stats Records */
+// 	curr_record_index = atomic_read(&current_record_index[cpu]);
+
+// 	if (is_load) {
+// 		if (!iscxl)
+// 			per_cpu_logs[cpu][curr_record_index].nr_dram_load_samples++;
+// 		else
+// 			per_cpu_logs[cpu][curr_record_index].nr_cxl_load_samples++;
+// 	} else {
+// 		if (!iscxl)
+// 			per_cpu_logs[cpu][curr_record_index].nr_dram_store_samples++;
+// 		else
+// 			per_cpu_logs[cpu][curr_record_index].nr_cxl_store_samples++;
+// 	}
+
+// 	return 0;
+// }
 
 static int update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
 		struct page *page, struct bwtier_sample *sample, bool is_load)

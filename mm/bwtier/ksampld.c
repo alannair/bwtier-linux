@@ -51,7 +51,7 @@ static int ksampld(void *ksampld_args)
 	struct perf_event_header *header;
 	struct bwtier_sample *sample;
 	int event_id, pos, pgshift, iterct, cpu, sample_batchsz;
-	uint64_t data_head, data_tail, pgindex, offset;
+	uint64_t data_head, data_tail, pgindex, offset, processed = 0;
 	uint64_t now = ktime_get_ns(), last = now, tdelta_ms;
 
 	sample_batchsz = (4 * atomic_read(&pebsfreq) * KSAMPLD_PERIOD_MS) / (3 * 1000);
@@ -98,7 +98,7 @@ static int ksampld(void *ksampld_args)
 						case PERF_RECORD_SAMPLE:
 							sample = (struct bwtier_sample *)header;
 							if (pid_is_tracked(sample->pid)) {
-								update_pginfo(sample, !(event_id % 2));
+								processed += update_pginfo(sample, !(event_id % 2));
 							}
 							break;
 						default:
@@ -112,6 +112,8 @@ static int ksampld(void *ksampld_args)
 			}
 		}
 
+		printk(KERN_INFO "[KSAMPLD] %llu %llu %llu samples\n", 
+				processed, data_head, data_tail);
 		last = now;
 		now = ktime_get_ns();
 		tdelta_ms = (now - last) / NSEC_PER_MSEC;

@@ -218,10 +218,9 @@ struct page {
 #endif
 
 #ifdef CONFIG_BWTIER
-	int bin_id;
-	uint32_t access_count;
-	uint64_t last_cooled_timestamp;
-	struct list_head bwtier_list;
+	atomic_t bin_id;
+	atomic_t access_count;
+	atomic64_t last_cooled_timestamp;
 #endif
 } _struct_page_alignment;
 

@@ -77,6 +77,7 @@ extern struct perf_event **eventlist;
 extern struct perf_event **counterlist;
 
 void bwtier_msleep(unsigned long msecs);
+struct folio *bwtier_get_folio(struct page *page);
 void cool_once(void);
 
 bool bwtier_status(void);

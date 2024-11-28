@@ -15,44 +15,44 @@ struct task_struct *kmigrtd_task = NULL;
 atomic_t stats_ms, migr_ms;
 atomic_t max_migr_pages_per_round;
 
-static struct folio *alloc_target_page(struct folio *src, unsigned long node)
-{
-	struct page *page, *newpage;
-	int bin_index;
-	gfp_t gfp_mask = (GFP_HIGHUSER_MOVABLE | __GFP_THISNODE |
-			__GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN) &
-			~__GFP_RECLAIM;
+// static struct folio *alloc_target_page(struct folio *src, unsigned long node)
+// {
+// 	struct page *page, *newpage;
+// 	int bin_index;
+// 	gfp_t gfp_mask = (GFP_HIGHUSER_MOVABLE | __GFP_THISNODE |
+// 			__GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN) &
+// 			~__GFP_RECLAIM;
 
-	if (folio_test_hugetlb(src) || folio_test_pmd_mappable(src))
-		return NULL;
+// 	if (folio_test_hugetlb(src) || folio_test_pmd_mappable(src))
+// 		return NULL;
 
-	page = folio_page(src, 0);
-	newpage = __alloc_pages_node((int)node, gfp_mask, 0);
-	bin_index = bin_index_from_bin_id(page->bin_id);
+// 	page = folio_page(src, 0);
+// 	newpage = __alloc_pages_node((int)node, gfp_mask, 0);
+// 	bin_index = bin_index_from_bin_id(page->bin_id);
 
-	mutex_lock(&(pg_hist_bins[bin_index].lock));
-	list_del(&page->bwtier_list);
-	if (node == 2 || node == 3) {
-		// migrating DRAM -> CXL
-		list_add(&(newpage->bwtier_list),
-			  &(pg_hist_bins[bin_index].cxl_pages_head));
-	} else {
-		// migrating CXL -> DRAM
-		list_add(&(newpage->bwtier_list),
-			  &(pg_hist_bins[bin_index].dram_pages_head));
-	}
-	mutex_unlock(&(pg_hist_bins[bin_index].lock));
+// 	mutex_lock(&(pg_hist_bins[bin_index].lock));
+// 	list_del(&page->bwtier_list);
+// 	if (node == 2 || node == 3) {
+// 		// migrating DRAM -> CXL
+// 		list_add(&(newpage->bwtier_list),
+// 			  &(pg_hist_bins[bin_index].cxl_pages_head));
+// 	} else {
+// 		// migrating CXL -> DRAM
+// 		list_add(&(newpage->bwtier_list),
+// 			  &(pg_hist_bins[bin_index].dram_pages_head));
+// 	}
+// 	mutex_unlock(&(pg_hist_bins[bin_index].lock));
 
-	newpage->bin_id = page->bin_id;
-	newpage->access_count = page->access_count;
-	newpage->last_cooled_timestamp = page->last_cooled_timestamp;
+// 	newpage->bin_id = page->bin_id;
+// 	newpage->access_count = page->access_count;
+// 	newpage->last_cooled_timestamp = page->last_cooled_timestamp;
 
-	page->bin_id = 0;
-	page->access_count = 0;
-	page->last_cooled_timestamp = 0;
+// 	page->bin_id = 0;
+// 	page->access_count = 0;
+// 	page->last_cooled_timestamp = 0;
 
-	return page_folio(newpage);
-}
+// 	return page_folio(newpage);
+// }
 
 /*
  * TODOs
@@ -67,19 +67,20 @@ static int bw_balance(void)
 	int nr_pages_migrated = 0, nrsuccess = 0;
 	unsigned long targetnid = 2;
 
-	while (new_index != old_index && 
-			nr_pages_migrated < max_migr_pages) {
-		migrate_pages(&(pg_hist_bins[new_index].dram_pages_head),
-				alloc_target_page, NULL, targetnid, MIGRATE_ASYNC,
-				MR_BWTIER, &nrsuccess);
+	// while (new_index != old_index && 
+	// 		nr_pages_migrated < max_migr_pages) {
+	// 	nrsuccess = 0;
+	// 	migrate_pages(&(pg_hist_bins[new_index].dram_pages_head),
+	// 			alloc_target_page, NULL, targetnid, MIGRATE_ASYNC,
+	// 			MR_BWTIER, &nrsuccess);
 
-		pg_hist_bins[new_index].nr_dram_pages -= nrsuccess;
-		pg_hist_bins[new_index].nr_cxl_pages += nrsuccess;
+	// 	pg_hist_bins[new_index].nr_dram_pages -= nrsuccess;
+	// 	pg_hist_bins[new_index].nr_cxl_pages += nrsuccess;
 
-		targetnid = (targetnid == 2) ? 3 : 2;
-		nr_pages_migrated += nrsuccess;
-		new_index = (new_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
-	}
+	// 	targetnid = (targetnid == 2) ? 3 : 2;
+	// 	nr_pages_migrated += nrsuccess;
+	// 	new_index = (new_index + NUM_BWTIER_BINS - 1) % NUM_BWTIER_BINS;
+	// }
 
 	printk(KERN_INFO "Migrated %d pages\n", nr_pages_migrated);
 
